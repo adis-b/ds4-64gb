@@ -119,11 +119,20 @@ The first prototype GGUF is meant to flip all routed-expert tensors to IQ1_S:
 | everything else | unchanged    | unchanged        |
 
 Projected file size: ~63 GB on disk (~24 GB saved versus q2). That fits
-comfortably on 96 GB Mac Studios and barely on 64 GB MacBooks once you account
-for KV cache and OS overhead at moderate context (32k–128k). Reaching a
-comfortable 64 GB fit will likely need either a more aggressive quant (TQ1_0
-ternary) or sparse residency for cold experts; both are out of scope for this
-branch.
+comfortably on 96 GB Mac Studios but is **still too large to be fully resident
+on a 64 GB Mac** once macOS (~14 GB), the ds4 process state and KV cache (~3-5
+GB at 32k context) are accounted for. The realistic resident-weights ceiling on
+a 64 GB box is around 45 GB.
+
+Two ways to close that gap on a 64 GB machine:
+
+1. Sparse residency: keep the q1 (or even q2) GGUF mmap'd, mark non-expert
+   tensors as `WILLNEED` and routed-expert blobs as `DONTNEED`, then track
+   which experts the router actually selects per layer and `WILLNEED` only
+   the top-K most-used. That is implemented behind
+   `--resident-experts-per-layer` (see "Sparse residency for 64 GB" below).
+2. A sub-1.5 bpw quant for routed experts (TQ1_0 ternary or a custom 1.0 bpw
+   format). Out of scope for this branch.
 
 To build the GGUF from the existing q2 file using `llama.cpp` (untested
 end-to-end with this engine; please file an issue if you try it):
@@ -150,6 +159,44 @@ Then point `ds4` at the new file:
 `./download_model.sh q1` is a placeholder for a future hosted version of the
 same file; it currently points at `adis-b/ds4-64gb-gguf` which is empty until
 someone uploads a tested artifact.
+
+### Sparse residency for 64 GB
+
+Since neither the q2 GGUF (87 GB) nor the q1 variant (~63 GB) fits fully in 64
+GB once macOS and KV cache are accounted for, this fork adds a sparse-residency
+policy on the mmap'd model. Two pieces:
+
+1. **Smart warm at startup.** With `--resident-experts-per-layer N` set, the
+   engine replaces the brute-force `--warm-weights` pass (which would just
+   thrash the page cache for an 87 GB file on a 64 GB box) with a smarter
+   default: `WILLNEED` on every non-expert tensor, `DONTNEED` on the routed
+   `ffn_(gate|up|down)_exps.weight` blobs. Always-hot weights stay resident;
+   experts page in lazily as the router asks for them, and the OS page cache
+   keeps the recently-used ones around naturally.
+
+2. **Adaptive top-K (Phase 1, in progress).** Counters are scaffolded; the
+   engine reads back router selections per token, exponentially decays
+   per-(layer, expert) hit counts, and every `--learn-routing-tokens` tokens
+   re-applies the top-K decision: `WILLNEED` on the most-used N experts per
+   layer, optional `DONTNEED` on the rest with `--residency-evict-cold`. Wiring
+   the routing telemetry through the Metal graph is a separate change; for now
+   `--learn-routing-tokens > 0` is accepted but only the static essentials warm
+   takes effect.
+
+Recommended starting point on a 64 GB Mac (with the q1 GGUF):
+
+```sh
+./ds4 -m gguf/DeepSeek-V4-Flash-IQ1S-routed-experts.gguf \
+      --ctx 32768 \
+      --resident-experts-per-layer 96 \
+      --residency-stats \
+      -p "Hi"
+```
+
+The exact best K depends on your workload. `96/256` covers a large chunk of
+typical routing for chat-style sessions; lower values save more RAM at the cost
+of more first-use page-in stalls. With `--residency-stats`, the engine prints a
+per-layer "top-8 covers X%" histogram on exit so you can tune.
 
 ## Speed
 

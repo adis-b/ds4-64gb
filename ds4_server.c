@@ -7893,6 +7893,13 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --resident-experts-per-layer N\n"
+        "      Enable sparse-residency policy on the mmap'd model. See ds4 --help.\n"
+        "  --learn-routing-tokens N\n"
+        "  --residency-decay F\n"
+        "  --residency-evict-cold\n"
+        "  --residency-stats\n"
+        "      Tuning knobs for the sparse-residency policy. See ds4 --help.\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
         "\n"
@@ -7978,6 +7985,7 @@ static server_config parse_options(int argc, char **argv) {
             .backend = default_server_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .residency_decay = 0.5f,
         },
         .host = "127.0.0.1",
         .port = 8000,
@@ -8045,6 +8053,19 @@ static server_config parse_options(int argc, char **argv) {
             directional_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--resident-experts-per-layer")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4-server: --resident-experts-per-layer needs N\n"); exit(2); }
+            c.engine.resident_experts_per_layer = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(arg, "--learn-routing-tokens")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4-server: --learn-routing-tokens needs N\n"); exit(2); }
+            c.engine.learn_routing_tokens = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(arg, "--residency-decay")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4-server: --residency-decay needs F\n"); exit(2); }
+            c.engine.residency_decay = (float)atof(argv[++i]);
+        } else if (!strcmp(arg, "--residency-evict-cold")) {
+            c.engine.residency_evict_cold = true;
+        } else if (!strcmp(arg, "--residency-stats")) {
+            c.engine.residency_stats = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {

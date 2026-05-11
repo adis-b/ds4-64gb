@@ -107,6 +107,25 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
+        "  --resident-experts-per-layer N\n"
+        "      Enable sparse-residency policy for the mmap'd model: keep N most-used\n"
+        "      routed experts per layer WILLNEED'd. Replaces the brute-force\n"
+        "      --warm-weights pass with a smart warm of non-expert tensors only.\n"
+        "      Set this on machines where the model exceeds RAM (e.g. 64 GB Macs\n"
+        "      running the q2 or q1 GGUF). Default: 0 (disabled).\n"
+        "  --learn-routing-tokens N\n"
+        "      Number of decoded tokens to observe before (re)applying the top-K\n"
+        "      residency policy. 0 leaves the policy static (essentials warm only).\n"
+        "      Default: 0.\n"
+        "  --residency-decay F\n"
+        "      Multiplier applied to per-expert hit counters at each apply window.\n"
+        "      0 zeroes the counters, 1 keeps them, 0.5 = half-life of one window.\n"
+        "      Default: 0.5.\n"
+        "  --residency-evict-cold\n"
+        "      Also DONTNEED experts that are NOT in the top-K. Frees RAM at the cost\n"
+        "      of a page-in penalty if a cold expert is later selected.\n"
+        "  --residency-stats\n"
+        "      Dump per-layer routing histograms to stderr on exit.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1178,6 +1197,7 @@ static cli_config parse_options(int argc, char **argv) {
             .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .residency_decay = 0.5f,
         },
         .gen = {
             .prompt = NULL,
@@ -1282,6 +1302,19 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--resident-experts-per-layer")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4: --resident-experts-per-layer needs N\n"); exit(2); }
+            c.engine.resident_experts_per_layer = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(arg, "--learn-routing-tokens")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4: --learn-routing-tokens needs N\n"); exit(2); }
+            c.engine.learn_routing_tokens = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (!strcmp(arg, "--residency-decay")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4: --residency-decay needs F\n"); exit(2); }
+            c.engine.residency_decay = (float)atof(argv[++i]);
+        } else if (!strcmp(arg, "--residency-evict-cold")) {
+            c.engine.residency_evict_cold = true;
+        } else if (!strcmp(arg, "--residency-stats")) {
+            c.engine.residency_stats = true;
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);

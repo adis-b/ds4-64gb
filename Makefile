@@ -15,16 +15,16 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_metal.o ds4_residency.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_residency.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 NVCCFLAGS ?= -O3 --use_fast_math -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_cuda.o ds4_residency.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_residency.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -33,8 +33,8 @@ endif
 all: ds4 ds4-server
 
 ifeq ($(UNAME_S),Darwin)
-metal-smoke: tools/metal_smoke.o ds4.o ds4_metal.o
-	$(CC) $(CFLAGS) -o $@ tools/metal_smoke.o ds4.o ds4_metal.o $(METAL_LDLIBS)
+metal-smoke: tools/metal_smoke.o ds4.o ds4_metal.o ds4_residency.o
+	$(CC) $(CFLAGS) -o $@ tools/metal_smoke.o ds4.o ds4_metal.o ds4_residency.o $(METAL_LDLIBS)
 
 tools/metal_smoke.o: tools/metal_smoke.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tools/metal_smoke.c
@@ -62,8 +62,11 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
 endif
 
-ds4.o: ds4.c ds4.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_gpu.h ds4_residency.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+ds4_residency.o: ds4_residency.c ds4_residency.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_residency.c
 
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -80,7 +83,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_gpu.h ds4_residency.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h

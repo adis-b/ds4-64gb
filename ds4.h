@@ -67,6 +67,21 @@ typedef struct {
     float directional_steering_ffn;
     bool warm_weights;
     bool quality;
+    /* Residency policy for the mmap'd model on RAM-constrained machines.
+     * resident_experts_per_layer = 0 disables the policy entirely.
+     * When > 0:
+     *   - the brute-force warm_weights pass is suppressed (it would only
+     *     pollute the page cache on a 64 GB box where the model exceeds RAM);
+     *   - non-expert tensors are WILLNEED'd as the always-hot baseline;
+     *   - the engine reads back router selections after each token and, every
+     *     learn_routing_tokens, WILLNEEDs the top-K experts per layer and
+     *     (if evict_cold) DONTNEEDs the rest.
+     */
+    uint32_t resident_experts_per_layer;
+    uint32_t learn_routing_tokens;
+    float    residency_decay;
+    bool     residency_evict_cold;
+    bool     residency_stats;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

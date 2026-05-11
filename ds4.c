@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_residency.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -1509,6 +1510,46 @@ static void model_warm_weights(const ds4_model *m) {
     const double t1 = now_sec();
     fprintf(stderr, "ds4: warmed tensor pages in %.3fs (checksum=%llu)\n",
             t1 - t0, (unsigned long long)checksum);
+}
+
+/* Routed-expert tensor names end in "_exps.weight" (gate/up/down across all
+ * experts of one layer). Shared experts are "_shexp.weight" and stay hot. */
+static bool tensor_name_is_routed_expert(const ds4_tensor *t) {
+    if (!t || t->name.ptr == NULL) return false;
+    static const char suffix[] = "_exps.weight";
+    const size_t lf = sizeof(suffix) - 1;
+    if (t->name.len < lf) return false;
+    return memcmp(t->name.ptr + (t->name.len - lf), suffix, lf) == 0;
+}
+
+/* Smart warm: WILLNEED everything that isn't a routed expert (always-hot
+ * baseline), DONTNEED routed-expert blobs (let them page in on demand and
+ * be warmed selectively by the residency policy). Used in place of
+ * model_warm_weights when --resident-experts-per-layer is set. */
+static void model_warm_essentials(const ds4_model *m) {
+    if (!m || !m->map) return;
+    ds4_residency_mmap mm = { .map = m->map, .size = m->size };
+
+    uint64_t hot = 0, cool = 0;
+    uint32_t n_hot = 0, n_cool = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (tensor_name_is_routed_expert(t)) {
+            ds4_residency_cool_region(mm, t->abs_offset, t->bytes);
+            cool += t->bytes;
+            n_cool++;
+        } else {
+            ds4_residency_warm_region(mm, t->abs_offset, t->bytes);
+            hot += t->bytes;
+            n_hot++;
+        }
+    }
+    fprintf(stderr,
+            "ds4: residency: warm-essentials WILLNEED %.2f GiB across %u tensors, "
+            "DONTNEED %.2f GiB across %u routed-expert blobs\n",
+            (double)hot  / (1024.0 * 1024.0 * 1024.0), n_hot,
+            (double)cool / (1024.0 * 1024.0 * 1024.0), n_cool);
 }
 
 /* =========================================================================
@@ -14044,6 +14085,13 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+    /* Sparse-residency policy: lives for the life of the engine. NULL when
+     * disabled (resident_experts_per_layer == 0). */
+    ds4_residency *residency;
+    bool           residency_active;
+    bool           residency_evict_cold;
+    bool           residency_stats_on_close;
+    uint32_t       residency_resident_per_layer;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -16583,10 +16631,56 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, true);
-    if (opt->warm_weights) model_warm_weights(&e->model);
+
+    e->residency_active = opt->resident_experts_per_layer > 0;
+    e->residency_evict_cold = opt->residency_evict_cold;
+    e->residency_stats_on_close = opt->residency_stats;
+    e->residency_resident_per_layer = opt->resident_experts_per_layer;
+
+    if (e->residency_active) {
+        /* Smart warm replaces the brute-force --warm-weights pass: on a
+         * 64 GB box that pass would just churn the page cache for an 87 GB
+         * model. Instead we WILLNEED non-expert tensors and DONTNEED routed
+         * experts. The adaptive top-K policy (Phase 1) re-warms hot experts
+         * once per-token routing telemetry is wired up. */
+        model_warm_essentials(&e->model);
+        if (opt->warm_weights) {
+            fprintf(stderr,
+                    "ds4: --warm-weights ignored (residency policy active; "
+                    "non-expert tensors already WILLNEED'd)\n");
+        }
+    } else if (opt->warm_weights) {
+        model_warm_weights(&e->model);
+    }
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+
+    if (e->residency_active) {
+        ds4_residency_options ro = {
+            .n_layers           = DS4_N_LAYER,
+            .n_experts          = DS4_N_EXPERT,
+            .learn_tokens       = opt->learn_routing_tokens,
+            .resident_per_layer = opt->resident_experts_per_layer,
+            .decay              = opt->residency_decay,
+            .evict_cold         = opt->residency_evict_cold,
+        };
+        e->residency = ds4_residency_create(&ro);
+        if (!e->residency) {
+            fprintf(stderr,
+                    "ds4: residency policy could not be created (oom?); "
+                    "continuing without it\n");
+            e->residency_active = false;
+        } else {
+            fprintf(stderr,
+                    "ds4: residency policy: resident_experts_per_layer=%u "
+                    "learn_tokens=%u decay=%.2f evict_cold=%d\n",
+                    opt->resident_experts_per_layer,
+                    opt->learn_routing_tokens,
+                    (double)opt->residency_decay,
+                    (int)opt->residency_evict_cold);
+        }
+    }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
@@ -16686,6 +16780,13 @@ void ds4_engine_summary(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (e->residency && e->residency_stats_on_close) {
+        ds4_residency_dump_stats(e->residency, stderr);
+    }
+    if (e->residency) {
+        ds4_residency_free(e->residency);
+        e->residency = NULL;
+    }
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
