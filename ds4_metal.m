@@ -189,7 +189,8 @@ static void ds4_gpu_print_device_summary(void) {
     }
 }
 
-#define DS4_METAL_MAX_MODEL_VIEWS 64
+#define DS4_METAL_MAX_MODEL_VIEWS_DEFAULT 256u
+#define DS4_METAL_MAX_MODEL_VIEWS_HARDCAP 8192u
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
 /* On RAM-constrained machines (e.g. the 64 GB target running an 80+ GB GGUF)
  * the implicit per-command-buffer Metal residency wires down every page of
@@ -199,7 +200,9 @@ static void ds4_gpu_print_device_summary(void) {
  * many smaller wraps means each layer command buffer only locks the few GiB
  * of weight pages it actually references. The threshold and target step are
  * conservative; they kick in automatically and can be overridden via the
- * DS4_METAL_MODEL_VIEW_MB env var. */
+ * DS4_METAL_MODEL_VIEW_MB env var. The maximum view count is similarly
+ * tunable via DS4_METAL_MAX_MODEL_VIEWS for users who want very small wraps
+ * (e.g. 512 MiB) on tight-memory hardware. */
 #define DS4_METAL_VIEW_BUDGET_NUM 3ull
 #define DS4_METAL_VIEW_BUDGET_DEN 4ull
 #define DS4_METAL_VIEW_DEFAULT_STEP_BYTES (4ull * 1024ull * 1024ull * 1024ull)
@@ -212,8 +215,41 @@ typedef struct {
     uint64_t bytes;
 } ds4_gpu_model_view;
 
-static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
-static uint32_t g_model_view_count;
+static ds4_gpu_model_view *g_model_views = NULL;
+static uint32_t g_model_view_count = 0;
+static uint32_t g_model_view_capacity = 0;
+
+static uint32_t ds4_gpu_model_view_max(void) {
+    uint32_t cap = DS4_METAL_MAX_MODEL_VIEWS_DEFAULT;
+    const char *env = getenv("DS4_METAL_MAX_MODEL_VIEWS");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0 && v <= DS4_METAL_MAX_MODEL_VIEWS_HARDCAP) {
+            cap = (uint32_t)v;
+        }
+    }
+    return cap;
+}
+
+static int ds4_gpu_model_views_reserve(uint32_t capacity) {
+    if (capacity == 0) capacity = DS4_METAL_MAX_MODEL_VIEWS_DEFAULT;
+    if (g_model_views && g_model_view_capacity >= capacity) return 1;
+    ds4_gpu_model_view *next = (ds4_gpu_model_view *)calloc(capacity, sizeof(*next));
+    if (!next) {
+        fprintf(stderr,
+                "ds4: failed to allocate %u model view slots (%llu bytes)\n",
+                capacity, (unsigned long long)((uint64_t)capacity * sizeof(*next)));
+        return 0;
+    }
+    if (g_model_views) {
+        for (uint32_t i = 0; i < g_model_view_count; i++) next[i] = g_model_views[i];
+        free(g_model_views);
+    }
+    g_model_views = next;
+    g_model_view_capacity = capacity;
+    return 1;
+}
 
 @interface DS4MetalTensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
@@ -360,12 +396,14 @@ static void ds4_gpu_progress_failed(void) {
 }
 
 static void ds4_gpu_model_views_clear(void) {
-    for (uint32_t i = 0; i < g_model_view_count; i++) {
-        g_model_views[i].buffer = nil;
-        g_model_views[i].model_map = NULL;
-        g_model_views[i].model_size = 0;
-        g_model_views[i].model_offset = 0;
-        g_model_views[i].bytes = 0;
+    if (g_model_views) {
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            g_model_views[i].buffer = nil;
+            g_model_views[i].model_map = NULL;
+            g_model_views[i].model_size = 0;
+            g_model_views[i].model_offset = 0;
+            g_model_views[i].bytes = 0;
+        }
     }
     g_model_view_count = 0;
 }
@@ -527,13 +565,17 @@ static int ds4_gpu_map_model_views(
     if (view_target > max_buffer) view_target = max_buffer;
 
     const uint64_t step = view_target - overlap;
+    const uint32_t view_cap = ds4_gpu_model_view_max();
+    if (!ds4_gpu_model_views_reserve(view_cap)) return 0;
     uint64_t off = 0;
     while (off < mapped_model_size) {
-        if (g_model_view_count == DS4_METAL_MAX_MODEL_VIEWS) {
+        if (g_model_view_count == g_model_view_capacity) {
             fprintf(stderr,
-                    "ds4: Metal model needs more than %u mapped views; raise "
-                    "DS4_METAL_MAX_MODEL_VIEWS or DS4_METAL_MODEL_VIEW_MB\n",
-                    (unsigned)DS4_METAL_MAX_MODEL_VIEWS);
+                    "ds4: Metal model needs more than %u mapped views; "
+                    "raise the cap via DS4_METAL_MAX_MODEL_VIEWS (max %u) or "
+                    "use a larger DS4_METAL_MODEL_VIEW_MB\n",
+                    (unsigned)g_model_view_capacity,
+                    (unsigned)DS4_METAL_MAX_MODEL_VIEWS_HARDCAP);
             return 0;
         }
 
