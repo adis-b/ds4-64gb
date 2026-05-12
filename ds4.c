@@ -8305,6 +8305,13 @@ typedef struct {
     ds4_gpu_tensor *router_logits;
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
+    /* router_history: per-token GPU-side aggregator of the router decisions
+     * across all DS4_N_LAYER layers, laid out as int32[N_LAYER][N_EXPERT_USED].
+     * Populated by a one-line intra-CB blit after each layer's router select,
+     * then read out by metal_graph_eval_token_raw_swa once per generated token
+     * and fed into the residency policy. Only allocated for the decode path;
+     * batched prefill has its own batch_router_selected. */
+    ds4_gpu_tensor *router_history;
     ds4_gpu_tensor *router_weights;
     ds4_gpu_tensor *routed_gate;
     ds4_gpu_tensor *routed_up;
@@ -8385,6 +8392,11 @@ typedef struct {
     float directional_steering_ffn_scale;
     bool quality;
     bool mtp_enabled;
+    /* Borrowed reference; the engine owns the residency object. NULL on CPU
+     * sessions or when the caller declined the smart-warm policy. When set,
+     * metal_graph_eval_token_raw_swa records one token's worth of routing
+     * decisions per call and triggers a re-apply when the policy says so. */
+    struct ds4_residency *residency;
 } ds4_gpu_graph;
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
@@ -8454,6 +8466,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->routed_gate);
     ds4_gpu_tensor_free(g->router_weights);
     ds4_gpu_tensor_free(g->router_selected);
+    ds4_gpu_tensor_free(g->router_history);
     ds4_gpu_tensor_free(g->router_probs);
     ds4_gpu_tensor_free(g->router_logits);
     ds4_gpu_tensor_free(g->shared_out);
@@ -8863,6 +8876,8 @@ static bool metal_graph_alloc_raw_cap(
     g->router_logits = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
     g->router_probs = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
     g->router_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
+    g->router_history  = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER *
+                                              DS4_N_EXPERT_USED * sizeof(int32_t));
     g->router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
     g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
@@ -9831,6 +9846,17 @@ static bool metal_graph_encode_decode_layer(
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
                                                 g->router_logits) != 0;
+    /* Phase 1 residency telemetry: snapshot this layer's selected expert ids
+     * into the per-token aggregator. Same-buffer intra-CB ordering means the
+     * read happens after the router kernel finishes; no GPU sync required.
+     * Skip when no residency policy is attached so the CB stays minimal on
+     * the well-resourced path. */
+    if (ok && g->router_history) {
+        ok = ds4_gpu_tensor_copy(g->router_history,
+                                 (uint64_t)il * DS4_N_EXPERT_USED * sizeof(int32_t),
+                                 g->router_selected, 0,
+                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t)) != 0;
+    }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
@@ -12717,6 +12743,62 @@ static bool metal_graph_encode_layer_batch(
 }
 
 /* Execute one Metal decode token and read back logits. */
+/* Phase 1 residency wiring helpers.
+ *
+ * The decode graph blits each layer's selected expert ids into
+ * g->router_history during encode. After the per-token command buffer
+ * completes we read the int32[N_LAYER][N_EXPERT_USED] aggregator back to
+ * the CPU once, feed it to the policy, and (when the policy says so)
+ * re-apply WILLNEED/DONTNEED on the resulting top-K cold set.
+ *
+ * The apply callback receives a ds4_weights pointer in `ud` so it can
+ * walk per-layer ffn_{gate,up,down}_exps offsets without holding any
+ * other state.
+ */
+static inline ds4_residency_region ds4_residency_expert_region(
+        const ds4_tensor *t, uint32_t expert) {
+    ds4_residency_region r = { 0, 0 };
+    if (!t) return r;
+    const uint64_t per_expert = t->bytes / (uint64_t)DS4_N_EXPERT;
+    r.off = t->abs_offset + (uint64_t)expert * per_expert;
+    r.len = per_expert;
+    return r;
+}
+
+static void metal_graph_residency_apply_regions_cb(
+        void                  *ud,
+        uint32_t               layer,
+        uint32_t               expert,
+        ds4_residency_region  *gate,
+        ds4_residency_region  *up,
+        ds4_residency_region  *down) {
+    const ds4_weights *weights = (const ds4_weights *)ud;
+    if (layer >= DS4_N_LAYER) {
+        gate->len = up->len = down->len = 0;
+        return;
+    }
+    const ds4_layer_weights *L = &weights->layer[layer];
+    *gate = ds4_residency_expert_region(L->ffn_gate_exps, expert);
+    *up   = ds4_residency_expert_region(L->ffn_up_exps,   expert);
+    *down = ds4_residency_expert_region(L->ffn_down_exps, expert);
+}
+
+static void metal_graph_residency_record_token(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights) {
+    if (!g->residency || !g->router_history) return;
+    int32_t hist[DS4_N_LAYER * DS4_N_EXPERT_USED];
+    if (ds4_gpu_tensor_read(g->router_history, 0, hist, sizeof(hist)) == 0) return;
+    ds4_residency_record_token(g->residency, hist, DS4_N_EXPERT_USED);
+    if (ds4_residency_should_apply(g->residency)) {
+        ds4_residency_mmap mm = { .map = model->map, .size = model->size };
+        ds4_residency_apply(g->residency, mm,
+                            metal_graph_residency_apply_regions_cb,
+                            (void *)weights, true);
+    }
+}
+
 static bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -12736,6 +12818,7 @@ static bool metal_graph_eval_token_raw_swa(
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    if (ok) metal_graph_residency_record_token(g, model, weights);
     if (profile) {
         const double t_read = now_sec();
         fprintf(stderr,
@@ -16848,6 +16931,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 1;
     }
     s->graph.quality = e->quality;
+    s->graph.residency = e->residency;
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
