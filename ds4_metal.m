@@ -189,8 +189,20 @@ static void ds4_gpu_print_device_summary(void) {
     }
 }
 
-#define DS4_METAL_MAX_MODEL_VIEWS 16
+#define DS4_METAL_MAX_MODEL_VIEWS 64
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
+/* On RAM-constrained machines (e.g. the 64 GB target running an 80+ GB GGUF)
+ * the implicit per-command-buffer Metal residency wires down every page of
+ * every bound MTLBuffer. With three ~28 GiB wraps a single layer's command
+ * buffer can ask the IOGPU driver to make 50+ GiB resident at once, which
+ * trips kIOGPUCommandBufferCallbackErrorOutOfMemory. Splitting the mmap into
+ * many smaller wraps means each layer command buffer only locks the few GiB
+ * of weight pages it actually references. The threshold and target step are
+ * conservative; they kick in automatically and can be overridden via the
+ * DS4_METAL_MODEL_VIEW_MB env var. */
+#define DS4_METAL_VIEW_BUDGET_NUM 3ull
+#define DS4_METAL_VIEW_BUDGET_DEN 4ull
+#define DS4_METAL_VIEW_DEFAULT_STEP_BYTES (4ull * 1024ull * 1024ull * 1024ull)
 
 typedef struct {
     __strong id<MTLBuffer> buffer;
@@ -371,8 +383,31 @@ static void ds4_gpu_model_residency_clear(void) {
     g_model_residency_count = 0;
 }
 
+/* True when the GPU is unlikely to be able to hold the entire mapped model
+ * resident at once. We use this to skip the up-front MTLResidencySet request
+ * and the kernel-driven warmup, which both assume the whole file fits in
+ * physical RAM. The threshold matches the model-view auto-shrink threshold
+ * so the two policies stay aligned. */
+static int ds4_gpu_model_fits_in_ram(uint64_t mapped_bytes) {
+    if (mapped_bytes == 0) return 1;
+    const uint64_t ram = ds4_gpu_system_memory_bytes();
+    if (ram == 0) return 1;
+    const uint64_t budget = ram / DS4_METAL_VIEW_BUDGET_DEN * DS4_METAL_VIEW_BUDGET_NUM;
+    return mapped_bytes <= budget;
+}
+
 static int ds4_gpu_model_residency_request_views(void) {
     if (g_model_view_count == 0 || getenv("DS4_METAL_NO_RESIDENCY") != NULL) return 1;
+
+    uint64_t mapped_total = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) mapped_total += g_model_views[i].bytes;
+    if (!ds4_gpu_model_fits_in_ram(mapped_total)) {
+        fprintf(stderr,
+                "ds4: Metal model (%.2f GiB) exceeds RAM budget; skipping residency set "
+                "(per-command-buffer residency only)\n",
+                mapped_total / 1024.0 / 1024.0 / 1024.0);
+        return 1;
+    }
 
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
@@ -408,6 +443,38 @@ static int ds4_gpu_model_residency_request_views(void) {
     return 1;
 }
 
+/* Pick the per-view target size. The driver pins every page of every bound
+ * MTLBuffer for the lifetime of the command buffer, so the natural unit of
+ * GPU "working set" pressure is the wrap size, not the actual touched range.
+ * When the mapped model is larger than physical RAM, default to ~4 GiB wraps;
+ * a single layer command buffer then references only the 1-3 wraps that hold
+ * its weights, which fits well inside the working-set budget. */
+static uint64_t ds4_gpu_model_view_target_bytes(
+        uint64_t max_buffer,
+        uint64_t mapped_model_size,
+        uint64_t page) {
+    const char *env = getenv("DS4_METAL_MODEL_VIEW_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long mb = strtoull(env, &end, 10);
+        if (end != env && mb > 0) {
+            uint64_t bytes = (uint64_t)mb * 1024ull * 1024ull;
+            bytes &= ~(page - 1);
+            if (bytes == 0) bytes = page;
+            if (bytes > max_buffer) bytes = max_buffer;
+            return bytes;
+        }
+    }
+    const uint64_t ram = ds4_gpu_system_memory_bytes();
+    if (ram == 0) return max_buffer;
+    const uint64_t pressure = ram / DS4_METAL_VIEW_BUDGET_DEN * DS4_METAL_VIEW_BUDGET_NUM;
+    if (mapped_model_size <= pressure) return max_buffer;
+    uint64_t bytes = DS4_METAL_VIEW_DEFAULT_STEP_BYTES;
+    bytes &= ~(page - 1);
+    if (bytes > max_buffer) bytes = max_buffer;
+    return bytes;
+}
+
 static int ds4_gpu_map_model_views(
         const void *model_map,
         uint64_t    model_size,
@@ -437,11 +504,12 @@ static int ds4_gpu_map_model_views(
      * CPU and is never dereferenced by kernels, so exposing it to Metal only
      * grows the residency set and the VM range the driver must validate.
      *
-     * Metal buffers have a device-specific maximum length, and this model is
-     * larger than that maximum on the target machines. Creating one no-copy
-     * buffer per tensor would avoid the length limit, but it would also move a
-     * lot of VM-object creation and residency bookkeeping into graph setup. The
-     * stable shape here is a tiny number of page-aligned views created once.
+     * Metal buffers have a device-specific maximum length. On a machine with
+     * enough RAM to keep the entire model resident we use the full
+     * maxBufferLength; the per-command-buffer working set is bounded by the
+     * physical RAM anyway. On a RAM-constrained box we clamp the per-view step
+     * down so that any one command buffer only locks a small fraction of the
+     * model into wired memory at a time. See ds4_gpu_model_view_target_bytes.
      *
      * Adjacent views intentionally overlap by more than the largest tensor, plus
      * one page for alignment. That invariant guarantees every tensor lies wholly
@@ -454,16 +522,23 @@ static int ds4_gpu_map_model_views(
         return 0;
     }
 
-    const uint64_t step = max_buffer - overlap;
+    uint64_t view_target = ds4_gpu_model_view_target_bytes(max_buffer, mapped_model_size, page);
+    if (view_target <= overlap) view_target = overlap + page;
+    if (view_target > max_buffer) view_target = max_buffer;
+
+    const uint64_t step = view_target - overlap;
     uint64_t off = 0;
     while (off < mapped_model_size) {
         if (g_model_view_count == DS4_METAL_MAX_MODEL_VIEWS) {
-            fprintf(stderr, "ds4: Metal model needs more mapped views than expected\n");
+            fprintf(stderr,
+                    "ds4: Metal model needs more than %u mapped views; raise "
+                    "DS4_METAL_MAX_MODEL_VIEWS or DS4_METAL_MODEL_VIEW_MB\n",
+                    (unsigned)DS4_METAL_MAX_MODEL_VIEWS);
             return 0;
         }
 
         uint64_t view_bytes = mapped_model_size - off;
-        if (view_bytes > max_buffer) view_bytes = max_buffer;
+        if (view_bytes > view_target) view_bytes = view_target;
 
         id<MTLBuffer> buffer = [g_device newBufferWithBytesNoCopy:(void *)(model_addr + page_model_offset + off)
                                                            length:(NSUInteger)view_bytes
@@ -494,7 +569,8 @@ static int ds4_gpu_map_model_views(
     }
 
     const double t_mapped = ds4_gpu_now_ms();
-    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
+    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
+                                  ds4_gpu_model_fits_in_ram(mapped_model_size);
     if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
     if (!ds4_gpu_model_residency_request_views()) {
         if (request_residency) ds4_gpu_progress_failed();
@@ -505,7 +581,8 @@ static int ds4_gpu_map_model_views(
     int warmed = 1;
     const double t_warm0 = ds4_gpu_now_ms();
     const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
-                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL;
+                                 getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL &&
+                                 ds4_gpu_model_fits_in_ram(mapped_model_size);
     if (warm_model_views) {
         /*
          * The first GPU command touching no-copy mmap storage can pay command
@@ -523,12 +600,14 @@ static int ds4_gpu_map_model_views(
     }
     const double t_warm = ds4_gpu_now_ms();
     fprintf(stderr,
-            "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
+            "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB, %u wraps of up to %.2f GiB each)\n",
             t_mapped - t0,
             t_resident - t_mapped,
             t_warm - t_warm0,
             mapped_model_size / 1024.0 / 1024.0,
-            page_model_offset / 1024.0 / 1024.0);
+            page_model_offset / 1024.0 / 1024.0,
+            g_model_view_count,
+            view_target / 1024.0 / 1024.0 / 1024.0);
     if (!warmed) return 0;
     return 1;
 }
@@ -707,16 +786,18 @@ static int ds4_gpu_warm_model_views(void) {
     }
     out.label = @"ds4_model_warmup";
 
-    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    if (!cb) {
-        fprintf(stderr, "ds4: Metal model warmup command buffer allocation failed\n");
-        return 0;
-    }
-
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:pipeline];
+    /* One command buffer per wrap. Binding every wrap into a single command
+     * buffer would force the driver to pin all model pages resident at once,
+     * which defeats the whole point of the smaller wraps on the 64 GB target. */
     uint64_t dst_offset = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        if (!cb) {
+            fprintf(stderr, "ds4: Metal model warmup command buffer allocation failed\n");
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipeline];
         const uint64_t bytes = g_model_views[i].bytes;
         const uint64_t n = (bytes + stride - 1) / stride;
         [enc setBuffer:g_model_views[i].buffer offset:0 atIndex:0];
@@ -726,17 +807,16 @@ static int ds4_gpu_warm_model_views(void) {
         [enc setBytes:&dst_offset length:sizeof(dst_offset) atIndex:4];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "ds4: Metal model warmup failed at wrap %u/%u: %s\n",
+                    i, g_model_view_count,
+                    [[cb.error localizedDescription] UTF8String]);
+            return 0;
+        }
         dst_offset += n;
-    }
-    ds4_gpu_end_compute_encoder(cb, enc);
-
-    [cb commit];
-    [cb waitUntilCompleted];
-
-    if (cb.status == MTLCommandBufferStatusError) {
-        fprintf(stderr, "ds4: Metal model warmup failed: %s\n",
-                [[cb.error localizedDescription] UTF8String]);
-        return 0;
     }
 
     return 1;
