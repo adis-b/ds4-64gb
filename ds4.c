@@ -10822,8 +10822,14 @@ static bool metal_graph_encode_token_raw_swa(
      * a fixed DS4 tape, not a dynamic node graph; four layers is the measured
      * point where the prefix is large enough to hide useful work without
      * starving the second command buffer.
+     *
+     * On RAM-constrained machines (mapped model > ~3/4 of physical RAM) we
+     * drop the stride to 1 so every layer becomes its own command buffer.
+     * Otherwise the implicit per-CB residency would pin every model wrap
+     * touched across all 43 layers and OOM the IOGPU driver, the same way
+     * the short-prompt prefill path used to before the auto-split fix.
      */
-    uint32_t split_after_layers = 4;
+    uint32_t split_after_layers = ds4_gpu_model_is_ram_constrained() ? 1u : 4u;
     const char *split_env = getenv("DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
@@ -10845,7 +10851,8 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
-        if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
+        if (ok && allow_split_flush && split_after_layers != 0 &&
+            (il + 1u) % split_after_layers == 0 && (il + 1u) < DS4_N_LAYER) {
             ok = ds4_gpu_flush_commands() != 0;
         }
     }
