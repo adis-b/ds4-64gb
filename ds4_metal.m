@@ -434,11 +434,30 @@ static int ds4_gpu_model_fits_in_ram(uint64_t mapped_bytes) {
     return mapped_bytes <= budget;
 }
 
+/* Sum of the mapped wrap byte counts. Includes the inter-view overlap so it
+ * over-counts the actual file size; the helpers below already account for that.
+ * Returns 0 before model wraps are created. */
+static uint64_t ds4_gpu_mapped_wrap_bytes(void) {
+    uint64_t mapped_total = 0;
+    for (uint32_t i = 0; i < g_model_view_count; i++) mapped_total += g_model_views[i].bytes;
+    return mapped_total;
+}
+
+/* True when the engine should treat the GPU as RAM-constrained for the
+ * purposes of higher-level scheduling decisions (e.g. command-buffer split
+ * granularity). Equivalent to "the mapped model doesn't fit in our budget
+ * fraction of physical RAM". Stays false on machines with enough RAM so the
+ * upstream short-prompt single-CB fast path is preserved there. */
+int ds4_gpu_model_is_ram_constrained(void) {
+    const uint64_t mapped_total = ds4_gpu_mapped_wrap_bytes();
+    if (mapped_total == 0) return 0;
+    return ds4_gpu_model_fits_in_ram(mapped_total) ? 0 : 1;
+}
+
 static int ds4_gpu_model_residency_request_views(void) {
     if (g_model_view_count == 0 || getenv("DS4_METAL_NO_RESIDENCY") != NULL) return 1;
 
-    uint64_t mapped_total = 0;
-    for (uint32_t i = 0; i < g_model_view_count; i++) mapped_total += g_model_views[i].bytes;
+    const uint64_t mapped_total = ds4_gpu_mapped_wrap_bytes();
     if (!ds4_gpu_model_fits_in_ram(mapped_total)) {
         fprintf(stderr,
                 "ds4: Metal model (%.2f GiB) exceeds RAM budget; skipping residency set "

@@ -34,6 +34,12 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* True when the mapped model is too large to safely pin in physical RAM as a
+ * single MTLBuffer working set. Used by higher-level schedulers to choose
+ * smaller command-buffer scopes on tight-memory machines. Returns 0 for the
+ * CUDA / CPU backends or before any model has been mapped. */
+int ds4_gpu_model_is_ram_constrained(void);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

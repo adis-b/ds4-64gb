@@ -12949,8 +12949,18 @@ static bool metal_graph_prefill_layer_major(
      * to watchdog WindowServer. Keep short prompts in one command buffer for
      * low overhead, but submit long prompts layer by layer so the display
      * server gets regular scheduling points.
+     *
+     * On RAM-constrained machines (mapped model > ~3/4 of physical RAM) we
+     * also force the per-layer split for short prompts. The single-CB path
+     * binds every model wrap touched across all 43 layers to one command
+     * buffer; the Metal driver then pins every page of every bound wrap for
+     * the CB's lifetime, which is fine on a 128 GB box but trips
+     * kIOGPUCommandBufferCallbackErrorOutOfMemory on a 64 GB box running an
+     * 80+ GB GGUF. Per-layer CBs cap the per-CB working set at one layer's
+     * weight set, which fits.
      */
-    const bool split_commands = split_profile || n_tokens > 2048;
+    const bool split_commands =
+        split_profile || n_tokens > 2048 || ds4_gpu_model_is_ram_constrained();
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? now_sec() : 0.0;
     double encode_s = 0.0;
