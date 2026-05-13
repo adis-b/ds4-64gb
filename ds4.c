@@ -1525,13 +1525,27 @@ static bool tensor_name_is_routed_expert(const ds4_tensor *t) {
 /* Smart warm: WILLNEED everything that isn't a routed expert (always-hot
  * baseline), DONTNEED routed-expert blobs (let them page in on demand and
  * be warmed selectively by the residency policy). Used in place of
- * model_warm_weights when --resident-experts-per-layer is set. */
-static void model_warm_essentials(const ds4_model *m) {
-    if (!m || !m->map) return;
+ * model_warm_weights when --resident-experts-per-layer is set.
+ *
+ * If lock_budget_bytes > 0, mlock the always-hot tensors up to that many
+ * bytes. mlock is the only way to actually prevent the OS from evicting
+ * those pages when the mapped model exceeds physical RAM; without it the
+ * WILLNEED hint is purely advisory and gets ignored under memory pressure,
+ * which on the 64 GB target translates directly into 18 s/token SSD
+ * thrashing. Returns the number of bytes actually mlocked so the caller
+ * can charge it against the residency module's running total.
+ */
+static uint64_t model_warm_essentials(const ds4_model *m, uint64_t lock_budget_bytes) {
+    if (!m || !m->map) return 0;
     ds4_residency_mmap mm = { .map = m->map, .size = m->size };
 
     uint64_t hot = 0, cool = 0;
     uint32_t n_hot = 0, n_cool = 0;
+    uint64_t lock_total = 0;
+    uint64_t lock_failed = 0;
+    uint64_t lock_overflow = 0;
+    bool lock_failed_warned = false;
+
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
@@ -1539,17 +1553,50 @@ static void model_warm_essentials(const ds4_model *m) {
             ds4_residency_cool_region(mm, t->abs_offset, t->bytes);
             cool += t->bytes;
             n_cool++;
-        } else {
-            ds4_residency_warm_region(mm, t->abs_offset, t->bytes);
-            hot += t->bytes;
-            n_hot++;
+            continue;
         }
+        ds4_residency_warm_region(mm, t->abs_offset, t->bytes);
+        hot += t->bytes;
+        n_hot++;
+
+        if (lock_budget_bytes == 0) continue;
+        if (lock_total + t->bytes > lock_budget_bytes) {
+            lock_overflow += t->bytes;
+            continue;
+        }
+        uint64_t pinned = ds4_residency_lock_region(mm, t->abs_offset, t->bytes);
+        if (pinned == 0) {
+            lock_failed += t->bytes;
+            if (!lock_failed_warned) {
+                fprintf(stderr,
+                        "ds4: residency: mlock failed for %.*s (errno=%d); "
+                        "falling back to WILLNEED only\n",
+                        (int)t->name.len, t->name.ptr, errno);
+                lock_failed_warned = true;
+            }
+            continue;
+        }
+        lock_total += pinned;
     }
-    fprintf(stderr,
-            "ds4: residency: warm-essentials WILLNEED %.2f GiB across %u tensors, "
-            "DONTNEED %.2f GiB across %u routed-expert blobs\n",
-            (double)hot  / (1024.0 * 1024.0 * 1024.0), n_hot,
-            (double)cool / (1024.0 * 1024.0 * 1024.0), n_cool);
+
+    if (lock_budget_bytes > 0) {
+        fprintf(stderr,
+                "ds4: residency: warm-essentials WILLNEED %.2f GiB across %u tensors, "
+                "DONTNEED %.2f GiB across %u routed-expert blobs "
+                "(mlock %.2f GiB ok, %.2f GiB over-budget, %.2f GiB mlock-failed)\n",
+                (double)hot   / (1024.0 * 1024.0 * 1024.0), n_hot,
+                (double)cool  / (1024.0 * 1024.0 * 1024.0), n_cool,
+                (double)lock_total    / (1024.0 * 1024.0 * 1024.0),
+                (double)lock_overflow / (1024.0 * 1024.0 * 1024.0),
+                (double)lock_failed   / (1024.0 * 1024.0 * 1024.0));
+    } else {
+        fprintf(stderr,
+                "ds4: residency: warm-essentials WILLNEED %.2f GiB across %u tensors, "
+                "DONTNEED %.2f GiB across %u routed-expert blobs\n",
+                (double)hot  / (1024.0 * 1024.0 * 1024.0), n_hot,
+                (double)cool / (1024.0 * 1024.0 * 1024.0), n_cool);
+    }
+    return lock_total;
 }
 
 /* =========================================================================
@@ -10833,6 +10880,20 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
+    /*
+     * Optional per-token breakdown. DS4_PROFILE_LAYERS=1 forces a GPU sync
+     * after each phase so wall-clock time reflects actual completion, not
+     * just async submission. The sync is deliberately heavyweight; this is
+     * a diagnostic path, not the hot loop.
+     */
+    const bool profile_layers = getenv("DS4_PROFILE_LAYERS") != NULL &&
+                                getenv("DS4_PROFILE_LAYERS")[0] &&
+                                getenv("DS4_PROFILE_LAYERS")[0] != '0';
+    double t_embed_ms = 0.0, t_output_ms = 0.0;
+    double t_layer_ms[DS4_N_LAYER];
+    for (uint32_t i = 0; i < DS4_N_LAYER; i++) t_layer_ms[i] = 0.0;
+
+    double t_a = profile_layers ? now_sec() : 0.0;
     bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                               model->map,
                                               model->size,
@@ -10841,6 +10902,10 @@ static bool metal_graph_encode_token_raw_swa(
                                               (uint32_t)token,
                                               DS4_N_EMBD,
                                               DS4_N_HC) != 0;
+    if (profile_layers && ok) {
+        ok = ds4_gpu_flush_commands() != 0;
+        t_embed_ms = (now_sec() - t_a) * 1000.0;
+    }
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -10864,6 +10929,7 @@ static bool metal_graph_encode_token_raw_swa(
     }
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        double t_l = profile_layers ? now_sec() : 0.0;
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -10877,14 +10943,41 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
-        if (ok && allow_split_flush && split_after_layers != 0 &&
-            (il + 1u) % split_after_layers == 0 && (il + 1u) < DS4_N_LAYER) {
+        if (profile_layers && ok) {
+            ok = ds4_gpu_flush_commands() != 0;
+            t_layer_ms[il] = (now_sec() - t_l) * 1000.0;
+        } else if (ok && allow_split_flush && split_after_layers != 0 &&
+                   (il + 1u) % split_after_layers == 0 && (il + 1u) < DS4_N_LAYER) {
             ok = ds4_gpu_flush_commands() != 0;
         }
     }
 
+    double t_o = profile_layers ? now_sec() : 0.0;
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        if (profile_layers && ok) {
+            ok = ds4_gpu_flush_commands() != 0;
+            t_output_ms = (now_sec() - t_o) * 1000.0;
+        }
+    }
+
+    if (profile_layers && ok) {
+        double layers_total = 0.0, layer_max = 0.0;
+        uint32_t layer_max_idx = 0;
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+            layers_total += t_layer_ms[i];
+            if (t_layer_ms[i] > layer_max) {
+                layer_max = t_layer_ms[i];
+                layer_max_idx = i;
+            }
+        }
+        fprintf(stderr,
+                "ds4: profile token pos=%u: embed=%.1fms layers_total=%.1fms "
+                "(avg=%.1fms, max=L%u@%.1fms) output=%.1fms grand=%.1fms\n",
+                pos, t_embed_ms, layers_total,
+                layers_total / (double)DS4_N_LAYER,
+                layer_max_idx, layer_max, t_output_ms,
+                t_embed_ms + layers_total + t_output_ms);
     }
     return ok;
 }
@@ -16737,13 +16830,50 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->residency_stats_on_close = opt->residency_stats;
     e->residency_resident_per_layer = opt->resident_experts_per_layer;
 
+    /* Order matters: residency is created before model_warm_essentials so
+     * the warm pass can charge essentials-mlock bytes against the residency
+     * module's running budget. apply() later does the same for top-K
+     * routed experts using whatever budget remains. */
+    if (e->residency_active) {
+        ds4_residency_options ro = {
+            .n_layers           = DS4_N_LAYER,
+            .n_experts          = DS4_N_EXPERT,
+            .learn_tokens       = opt->learn_routing_tokens,
+            .resident_per_layer = opt->resident_experts_per_layer,
+            .decay              = opt->residency_decay,
+            .evict_cold         = opt->residency_evict_cold,
+            .lock_budget_bytes  = opt->residency_lock_budget_bytes,
+        };
+        e->residency = ds4_residency_create(&ro);
+        if (!e->residency) {
+            fprintf(stderr,
+                    "ds4: residency policy could not be created (oom?); "
+                    "continuing without it\n");
+            e->residency_active = false;
+        } else {
+            fprintf(stderr,
+                    "ds4: residency policy: resident_experts_per_layer=%u "
+                    "learn_tokens=%u decay=%.2f evict_cold=%d lock_budget=%.2f GiB\n",
+                    opt->resident_experts_per_layer,
+                    opt->learn_routing_tokens,
+                    (double)opt->residency_decay,
+                    (int)opt->residency_evict_cold,
+                    (double)opt->residency_lock_budget_bytes /
+                        (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+
     if (e->residency_active) {
         /* Smart warm replaces the brute-force --warm-weights pass: on a
          * 64 GB box that pass would just churn the page cache for an 87 GB
          * model. Instead we WILLNEED non-expert tensors and DONTNEED routed
          * experts. The adaptive top-K policy (Phase 1) re-warms hot experts
          * once per-token routing telemetry is wired up. */
-        model_warm_essentials(&e->model);
+        uint64_t locked_essentials = model_warm_essentials(
+                &e->model, opt->residency_lock_budget_bytes);
+        if (e->residency && locked_essentials > 0) {
+            ds4_residency_set_locked_essentials(e->residency, locked_essentials);
+        }
         if (opt->warm_weights) {
             fprintf(stderr,
                     "ds4: --warm-weights ignored (residency policy active; "
@@ -16755,32 +16885,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
-
-    if (e->residency_active) {
-        ds4_residency_options ro = {
-            .n_layers           = DS4_N_LAYER,
-            .n_experts          = DS4_N_EXPERT,
-            .learn_tokens       = opt->learn_routing_tokens,
-            .resident_per_layer = opt->resident_experts_per_layer,
-            .decay              = opt->residency_decay,
-            .evict_cold         = opt->residency_evict_cold,
-        };
-        e->residency = ds4_residency_create(&ro);
-        if (!e->residency) {
-            fprintf(stderr,
-                    "ds4: residency policy could not be created (oom?); "
-                    "continuing without it\n");
-            e->residency_active = false;
-        } else {
-            fprintf(stderr,
-                    "ds4: residency policy: resident_experts_per_layer=%u "
-                    "learn_tokens=%u decay=%.2f evict_cold=%d\n",
-                    opt->resident_experts_per_layer,
-                    opt->learn_routing_tokens,
-                    (double)opt->residency_decay,
-                    (int)opt->residency_evict_cold);
-        }
-    }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;

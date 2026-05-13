@@ -82,6 +82,12 @@ typedef struct {
     float    residency_decay;
     bool     residency_evict_cold;
     bool     residency_stats;
+    /* If > 0, the residency module will mlock up to this many bytes of warm
+     * regions (essentials first, then top-K routed experts). Page-aligned
+     * mlock removes the page-cache eviction that otherwise pulls the hot
+     * working set back from disk on every token when the mapped model
+     * exceeds physical RAM. 0 = legacy madvise-only behavior. */
+    uint64_t residency_lock_budget_bytes;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

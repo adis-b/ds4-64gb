@@ -126,6 +126,12 @@ static void usage(FILE *fp) {
         "      of a page-in penalty if a cold expert is later selected.\n"
         "  --residency-stats\n"
         "      Dump per-layer routing histograms to stderr on exit.\n"
+        "  --residency-lock-budget-gib F\n"
+        "      Cap (in GiB) on how much of the warm working set the residency module\n"
+        "      is allowed to mlock. Essentials are locked first, then top-K experts up\n"
+        "      to the budget. mlock removes the OS page-cache eviction that otherwise\n"
+        "      thrashes the SSD on every token when the mapped model exceeds RAM.\n"
+        "      Default: 0 (disabled, legacy madvise-only behavior).\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1315,6 +1321,12 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.residency_evict_cold = true;
         } else if (!strcmp(arg, "--residency-stats")) {
             c.engine.residency_stats = true;
+        } else if (!strcmp(arg, "--residency-lock-budget-gib")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4: --residency-lock-budget-gib needs F\n"); exit(2); }
+            double gib = atof(argv[++i]);
+            if (gib < 0.0) gib = 0.0;
+            c.engine.residency_lock_budget_bytes =
+                (uint64_t)(gib * 1024.0 * 1024.0 * 1024.0);
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);

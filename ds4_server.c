@@ -8066,6 +8066,12 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.residency_evict_cold = true;
         } else if (!strcmp(arg, "--residency-stats")) {
             c.engine.residency_stats = true;
+        } else if (!strcmp(arg, "--residency-lock-budget-gib")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4-server: --residency-lock-budget-gib needs F\n"); exit(2); }
+            double gib = atof(argv[++i]);
+            if (gib < 0.0) gib = 0.0;
+            c.engine.residency_lock_budget_bytes =
+                (uint64_t)(gib * 1024.0 * 1024.0 * 1024.0);
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {

@@ -4,10 +4,16 @@
  * On Macs with less RAM than the model file (notably the 64 GB target),
  * we don't want every weight page warm. Instead we:
  *   - keep "always-hot" weights (norms, attention, embeddings, output) WILLNEED'd
+ *     and (optionally) mlock'd so the OS cannot evict them
  *   - track which routed experts the router actually selected per layer
- *   - WILLNEED the top-K most-used experts, DONTNEED the rest
+ *   - WILLNEED+mlock the top-K most-used experts (subject to a byte budget),
+ *     DONTNEED the rest
  *
- * All hints are advisory. The OS makes the final eviction decisions.
+ * Without mlock, hints are advisory and the OS can evict warm pages under
+ * memory pressure. On hosts where the mapped model exceeds physical RAM that
+ * causes continuous SSD page-ins during inference. With a sensible
+ * lock_budget_bytes the hot working set becomes genuinely pinned and only the
+ * cold tail thrashes.
  *
  * This module deliberately knows nothing about ds4_tensor / ds4_model. The
  * caller passes the mmap base + size and supplies file regions as
@@ -40,6 +46,17 @@ typedef struct {
     /* If true, the apply call also issues DONTNEED on the cold experts.
      * Set false to only WILLNEED hot experts and leave the rest to LRU. */
     bool     evict_cold;
+    /* If > 0, the residency module will mlock warm regions (essentials and
+     * top-K routed experts) up to this many bytes in total. Beyond the
+     * budget it falls back to WILLNEED so we never starve the OS.
+     *
+     * Essentials are locked first and remain locked for the engine lifetime.
+     * The remainder of the budget is used by each apply() call: regions that
+     * fall out of the new top-K are munlocked, regions that newly enter the
+     * top-K are mlocked as long as the running total stays under budget.
+     *
+     * 0 disables mlock entirely (legacy madvise-only behavior). */
+    uint64_t lock_budget_bytes;
 } ds4_residency_options;
 
 ds4_residency *ds4_residency_create(const ds4_residency_options *opt);
@@ -55,6 +72,25 @@ typedef struct {
  * clamped to the file. No-ops if the platform lacks posix_madvise. */
 void ds4_residency_warm_region(ds4_residency_mmap m, uint64_t off, uint64_t len);
 void ds4_residency_cool_region(ds4_residency_mmap m, uint64_t off, uint64_t len);
+
+/* mlock / munlock a single region, page-aligned and clamped to the file.
+ * lock_region returns the number of bytes actually pinned (the aligned span
+ * on success, 0 on failure). These are stateless and have no budget; the
+ * caller is responsible for tracking the running total. Useful for pinning
+ * the always-hot essentials before the residency policy object exists. */
+uint64_t ds4_residency_lock_region(ds4_residency_mmap m, uint64_t off, uint64_t len);
+void     ds4_residency_unlock_region(ds4_residency_mmap m, uint64_t off, uint64_t len);
+
+/* Returns the residency module's current mlock footprint (essentials plus
+ * the routed experts currently locked by apply()). 0 if no module or no
+ * budget. */
+uint64_t ds4_residency_locked_bytes(const ds4_residency *r);
+
+/* Tells the residency module that the caller has already mlocked this many
+ * bytes for the always-hot essentials, so the running total reported by
+ * apply() and dump_stats matches reality. Idempotent: each call replaces
+ * the prior value. */
+void ds4_residency_set_locked_essentials(ds4_residency *r, uint64_t bytes);
 
 /* Walk a list of "always-hot" file regions and WILLNEED them. Intended to be
  * called once at engine startup for everything that isn't a routed expert.

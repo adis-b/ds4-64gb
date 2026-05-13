@@ -219,6 +219,26 @@ static ds4_gpu_model_view *g_model_views = NULL;
 static uint32_t g_model_view_count = 0;
 static uint32_t g_model_view_capacity = 0;
 
+/*
+ * Range-exact MTLBuffer cache used on RAM-constrained machines.
+ *
+ * The wrap pool above (g_model_views) carves the mmap into a handful of large
+ * MTLBuffers and binds whichever wrap contains a requested (offset,len). That
+ * is fast but the Metal driver pins every page of every bound MTLBuffer for
+ * the lifetime of the command buffer -- so even though a decode-layer CB only
+ * actually touches ~1.5 GiB of weight data, it ends up pinning the whole
+ * multi-GiB wrap (or wraps) those weights live in. On a 64 GiB Mac running
+ * an 80+ GiB GGUF that's the difference between paging and wedging.
+ *
+ * On constrained hosts ds4_gpu_wrap_model_range instead returns a freshly
+ * created MTLBuffer that spans exactly the page-aligned cover of the request,
+ * cached by (mmap base, aligned_offset, aligned_len). The total number of
+ * unique cache entries is bounded by the model's tensor count (~1.3k for DS4
+ * Flash), so steady-state allocation cost is paid once and the per-CB pinned
+ * set drops from "wrap size" to "actual tensor bytes".
+ */
+static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_range_buffer_cache = nil;
+
 static uint32_t ds4_gpu_model_view_max(void) {
     uint32_t cap = DS4_METAL_MAX_MODEL_VIEWS_DEFAULT;
     const char *env = getenv("DS4_METAL_MAX_MODEL_VIEWS");
@@ -406,6 +426,10 @@ static void ds4_gpu_model_views_clear(void) {
         }
     }
     g_model_view_count = 0;
+    if (g_range_buffer_cache) {
+        [g_range_buffer_cache removeAllObjects];
+        g_range_buffer_cache = nil;
+    }
 }
 
 static void ds4_gpu_model_residency_clear(void) {
@@ -627,6 +651,28 @@ static int ds4_gpu_map_model_views(
 
         if (off + view_bytes >= mapped_model_size) break;
         off += step;
+    }
+
+    /*
+     * On RAM-constrained hosts ds4_gpu_wrap_model_range routes every tensor
+     * binding through ds4_gpu_get_range_buffer (per-range MTLBuffers cached
+     * by aligned (offset, len)). The wrap-pool MTLBuffers above are never
+     * bound to encoders in that mode. Empirically the Metal driver still
+     * appears to track those wrap MTLBuffers' VM ranges as part of the
+     * device working set, which defeats the whole point of per-range
+     * binding. Releasing the wrap MTLBuffers here (while keeping the byte
+     * bookkeeping intact for budget heuristics) lets Metal forget about
+     * those overlapping VM mappings while the range cache becomes the
+     * single source of truth for what's actually bound.
+     *
+     * The non-constrained path is untouched: those machines have enough
+     * RAM to keep the entire model pinned anyway, so the wrap fast path
+     * is preserved verbatim.
+     */
+    if (!ds4_gpu_model_fits_in_ram(mapped_model_size)) {
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            g_model_views[i].buffer = nil;
+        }
     }
 
     const double t_mapped = ds4_gpu_now_ms();
@@ -4588,16 +4634,88 @@ int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
+/*
+ * Range-exact MTLBuffer helper for RAM-constrained mode.
+ *
+ * Returns an MTLBuffer whose VM range is the page-aligned cover of
+ * [offset, offset+len) within the mmap. *inner_offset is set to the byte
+ * distance from the buffer base to the requested tensor offset, which is
+ * exactly the value callers feed to setBuffer:offset:atIndex:.
+ *
+ * Buffers are cached by (mmap base, aligned_offset, aligned_len). The cache
+ * is cleared in ds4_gpu_model_views_clear when the model is unmapped.
+ */
+static id<MTLBuffer> ds4_gpu_get_range_buffer(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    len,
+        uint64_t   *inner_offset) {
+    const uint64_t page = (uint64_t)getpagesize();
+    const uintptr_t model_addr = (uintptr_t)model_map;
+    if ((model_addr & (uintptr_t)(page - 1)) != 0) {
+        fprintf(stderr, "ds4: Metal model mmap base is not page aligned\n");
+        return nil;
+    }
+
+    const uint64_t aligned_off = offset & ~(page - 1);
+    uint64_t aligned_end = round_up_u64(offset + len, page);
+    if (aligned_end > model_size) aligned_end = model_size;
+    if (aligned_end <= aligned_off) {
+        fprintf(stderr, "ds4: Metal range buffer alignment produced empty span\n");
+        return nil;
+    }
+    const uint64_t aligned_len = aligned_end - aligned_off;
+    *inner_offset = offset - aligned_off;
+
+    if (!g_range_buffer_cache) {
+        g_range_buffer_cache = [[NSMutableDictionary alloc] init];
+    }
+    NSString *key = [NSString stringWithFormat:@"%p:%llu:%llu",
+                              model_map,
+                              (unsigned long long)aligned_off,
+                              (unsigned long long)aligned_len];
+    id<MTLBuffer> buf = g_range_buffer_cache[key];
+    if (buf) return buf;
+
+    buf = [g_device newBufferWithBytesNoCopy:(void *)(model_addr + aligned_off)
+                                      length:(NSUInteger)aligned_len
+                                     options:MTLResourceStorageModeShared
+                                 deallocator:nil];
+    if (!buf) {
+        fprintf(stderr,
+                "ds4: Metal could not create range buffer at offset %.2f GiB len %.2f GiB\n",
+                ds4_gpu_gib(aligned_off), ds4_gpu_gib(aligned_len));
+        return nil;
+    }
+    buf.label = [NSString stringWithFormat:@"ds4_range_%llu_%llu",
+                          (unsigned long long)aligned_off,
+                          (unsigned long long)aligned_len];
+    g_range_buffer_cache[key] = buf;
+    return buf;
+}
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
         uint64_t    offset,
         uint64_t    len,
         uint64_t   *inner_offset) {
-    (void)model_map;
     if (model_size == 0 || offset > model_size || len > model_size - offset) {
         fprintf(stderr, "ds4: Metal model range is outside the mapped model\n");
         return nil;
+    }
+
+    /*
+     * RAM-constrained hosts use per-range MTLBuffers so the Metal driver
+     * only pins the bytes a command buffer actually references. The wrap
+     * pool is still maintained as bookkeeping (for the mapped_wrap_bytes
+     * budget heuristic), but its MTLBuffers are never bound to encoders
+     * in this mode. Non-constrained hosts keep the original fast path
+     * unchanged so we don't regress machines with enough RAM.
+     */
+    if (ds4_gpu_model_is_ram_constrained()) {
+        return ds4_gpu_get_range_buffer(model_map, model_size, offset, len, inner_offset);
     }
 
     const uint64_t end = offset + len;
