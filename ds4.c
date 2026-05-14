@@ -16895,6 +16895,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             .decay              = opt->residency_decay,
             .evict_cold         = opt->residency_evict_cold,
             .lock_budget_bytes  = opt->residency_lock_budget_bytes,
+            .cache_path         = opt->residency_cache_path,
         };
         e->residency = ds4_residency_create(&ro);
         if (!e->residency) {
@@ -16942,6 +16943,27 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
+
+    /* Replay-on-load: if the residency policy seeded its hit counters from
+     * a persisted routing cache, apply() the top-K now -- before generation
+     * starts -- so the very first token is already routed against the warm
+     * expert set. Without this the first learn_routing_tokens tokens still
+     * pay the cold-page-in cost on every restart. We pass reset=false to
+     * keep the loaded counters intact; the regular learn-window cadence
+     * resumes once record_token() starts firing.
+     *
+     * The expert-region callback lives behind DS4_NO_GPU because the
+     * record/apply loop only runs in the Metal/CUDA backends. CPU-only
+     * builds therefore have no token telemetry and there is nothing to
+     * replay against. */
+#ifndef DS4_NO_GPU
+    if (e->residency && ds4_residency_has_loaded_state(e->residency)) {
+        ds4_residency_mmap mm = { .map = e->model.map, .size = e->model.size };
+        ds4_residency_apply(e->residency, mm,
+                            metal_graph_residency_apply_regions_cb,
+                            (void *)&e->weights, false);
+    }
+#endif
     if (opt->mtp_path && opt->mtp_path[0]) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);

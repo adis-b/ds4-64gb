@@ -88,6 +88,14 @@ typedef struct {
      * working set back from disk on every token when the mapped model
      * exceeds physical RAM. 0 = legacy madvise-only behavior. */
     uint64_t residency_lock_budget_bytes;
+    /* Optional file path where the residency module persists its per-(layer,
+     * expert) hit counters across runs. If non-NULL and the file exists, the
+     * engine seeds the policy with those counters and calls apply() once
+     * before generation starts so the first token is already routed against
+     * the previously-hot expert set, skipping the learn_routing_tokens warm-
+     * up window. The file is rewritten after each apply. NULL disables the
+     * cache (default). */
+    const char *residency_cache_path;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

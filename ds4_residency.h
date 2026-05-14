@@ -57,6 +57,14 @@ typedef struct {
      *
      * 0 disables mlock entirely (legacy madvise-only behavior). */
     uint64_t lock_budget_bytes;
+    /* Optional path to a routing-cache file written by previous runs. If
+     * non-NULL and non-empty and the file exists with a matching (n_layers,
+     * n_experts) shape, ds4_residency_create() reads its hit counters into
+     * the new module so the very first apply() can pin the right experts
+     * without waiting learn_tokens to relearn them. If non-NULL but absent
+     * (or malformed) the module starts empty as before. The module then
+     * rewrites the file after every apply() so the cache stays current. */
+    const char *cache_path;
 } ds4_residency_options;
 
 ds4_residency *ds4_residency_create(const ds4_residency_options *opt);
@@ -142,6 +150,18 @@ void ds4_residency_apply(ds4_residency                  *r,
                          ds4_residency_expert_regions_fn fn,
                          void                           *ud,
                          bool                            reset);
+
+/* True if the module loaded hit counters from cache_path during create().
+ * The engine uses this to know it should call apply() right after
+ * weights_bind, instead of waiting for learn_tokens to elapse. */
+bool ds4_residency_has_loaded_state(const ds4_residency *r);
+
+/* Persist current hit counters to a file. Format: 32-byte header
+ * (magic "DS4_RES1", version, n_layers, n_experts, total_tokens,
+ * apply_count) plus n_layers * n_experts uint64 hits in host byte order
+ * (we don't move these caches across machines). Returns 0 on success,
+ * -1 on any I/O error. Writes are atomic via a sibling .tmp + rename. */
+int ds4_residency_save_state(const ds4_residency *r, const char *path);
 
 void ds4_residency_dump_stats(const ds4_residency *r, FILE *fp);
 

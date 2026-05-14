@@ -132,6 +132,13 @@ static void usage(FILE *fp) {
         "      to the budget. mlock removes the OS page-cache eviction that otherwise\n"
         "      thrashes the SSD on every token when the mapped model exceeds RAM.\n"
         "      Default: 0 (disabled, legacy madvise-only behavior).\n"
+        "  --residency-cache PATH\n"
+        "      Persist per-(layer, expert) routing-hit counters at PATH and reuse them\n"
+        "      on the next run. When the file exists at startup the engine apply()s the\n"
+        "      top-K residency policy before generation begins, so the first decoded\n"
+        "      token is already routed against the previously-hot expert set instead of\n"
+        "      paying the learn-routing-tokens warm-up. The file is rewritten after each\n"
+        "      apply (~88 KiB for DS4 Flash). Default: disabled.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1327,6 +1334,9 @@ static cli_config parse_options(int argc, char **argv) {
             if (gib < 0.0) gib = 0.0;
             c.engine.residency_lock_budget_bytes =
                 (uint64_t)(gib * 1024.0 * 1024.0 * 1024.0);
+        } else if (!strcmp(arg, "--residency-cache")) {
+            if (i + 1 >= argc) { fprintf(stderr, "ds4: --residency-cache needs PATH\n"); exit(2); }
+            c.engine.residency_cache_path = argv[++i];
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);

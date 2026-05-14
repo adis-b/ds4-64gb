@@ -2,13 +2,19 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#define DS4_RESIDENCY_CACHE_MAGIC   "DS4_RES1"
+#define DS4_RESIDENCY_CACHE_VERSION 1u
+
 struct ds4_residency {
     ds4_residency_options opt;
+    char     *cache_path;        /* owned copy of opt.cache_path; NULL if disabled */
+    bool      has_loaded_state;  /* true iff cache_path was read in create() */
     uint64_t *hits;
     uint64_t  observed_tokens;
     uint64_t  total_tokens;
@@ -22,9 +28,56 @@ struct ds4_residency {
     bool      lock_failed_warned;
 };
 
+/* Routing-cache header. Written/read verbatim in host byte order. We don't
+ * try to make the cache portable across machines; it's a perf cache local
+ * to one install. The magic + version + (n_layers, n_experts) check is just
+ * to reject obviously-wrong files. */
+typedef struct {
+    char     magic[8];      /* "DS4_RES1" exactly */
+    uint32_t version;       /* DS4_RESIDENCY_CACHE_VERSION */
+    uint32_t n_layers;      /* must equal opt.n_layers on load */
+    uint32_t n_experts;     /* must equal opt.n_experts on load */
+    uint32_t reserved0;
+    uint64_t total_tokens;
+    uint64_t apply_count;
+} ds4_residency_cache_header;
+
 static uint64_t res_page(void) {
     long ps = sysconf(_SC_PAGESIZE);
     return ps > 0 ? (uint64_t)ps : 4096u;
+}
+
+/* Try to read a routing-cache file written by save_state. On success, *hits
+ * is populated and the file's total_tokens / apply_count are returned via
+ * the out params. Returns 0 on success, -1 on missing file, malformed
+ * header, or shape mismatch. */
+static int res_read_cache_file(const char *path,
+                               uint32_t    n_layers,
+                               uint32_t    n_experts,
+                               uint64_t   *hits,
+                               uint64_t   *total_tokens_out,
+                               uint64_t   *apply_count_out) {
+    if (!path || !path[0]) return -1;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    ds4_residency_cache_header h;
+    if (fread(&h, sizeof(h), 1, fp) != 1) { fclose(fp); return -1; }
+    if (memcmp(h.magic, DS4_RESIDENCY_CACHE_MAGIC, 8) != 0 ||
+        h.version   != DS4_RESIDENCY_CACHE_VERSION ||
+        h.n_layers  != n_layers ||
+        h.n_experts != n_experts) {
+        fclose(fp);
+        return -1;
+    }
+    const size_t n_cells = (size_t)n_layers * n_experts;
+    if (fread(hits, sizeof(hits[0]), n_cells, fp) != n_cells) {
+        fclose(fp);
+        return -1;
+    }
+    if (total_tokens_out) *total_tokens_out = h.total_tokens;
+    if (apply_count_out)  *apply_count_out  = h.apply_count;
+    fclose(fp);
+    return 0;
 }
 
 ds4_residency *ds4_residency_create(const ds4_residency_options *opt) {
@@ -39,18 +92,91 @@ ds4_residency *ds4_residency_create(const ds4_residency_options *opt) {
                                 sizeof(r->locked_mask[0]));
         if (!r->locked_mask) { free(r->hits); free(r); return NULL; }
     }
+    /* Routing-cache: store a private copy of the path so the caller can
+     * reuse / free its string, and attempt to seed counters from prior runs.
+     * A missing or malformed cache is not an error -- we just start empty. */
+    if (opt->cache_path && opt->cache_path[0]) {
+        size_t n = strlen(opt->cache_path);
+        r->cache_path = malloc(n + 1);
+        if (r->cache_path) memcpy(r->cache_path, opt->cache_path, n + 1);
+        uint64_t loaded_total = 0, loaded_applies = 0;
+        if (res_read_cache_file(r->cache_path,
+                                opt->n_layers, opt->n_experts,
+                                r->hits,
+                                &loaded_total, &loaded_applies) == 0) {
+            r->has_loaded_state = true;
+            r->total_tokens = loaded_total;
+            r->apply_count  = loaded_applies;
+            fprintf(stderr,
+                    "ds4: residency: loaded routing cache from %s "
+                    "(lifetime=%llu applies=%llu)\n",
+                    r->cache_path,
+                    (unsigned long long)loaded_total,
+                    (unsigned long long)loaded_applies);
+        } else {
+            fprintf(stderr,
+                    "ds4: residency: no usable routing cache at %s; "
+                    "will populate on first apply\n",
+                    r->cache_path);
+        }
+    }
     return r;
 }
 
 void ds4_residency_free(ds4_residency *r) {
     if (!r) return;
+    /* Persist whatever partial-window observations have accumulated since
+     * the last apply. apply() saves on every fire, but a short run that
+     * doesn't reach learn_tokens would otherwise discard up to learn_tokens
+     * worth of routing data. Best-effort: a failed save is logged inside
+     * save_state's caller-path elsewhere; here it just gets ignored. */
+    if (r->cache_path) {
+        (void)ds4_residency_save_state(r, r->cache_path);
+    }
     /* Note: we intentionally do NOT munlock here. The mmap is owned by the
      * caller; when it goes away the mlocks go away with it. Unlocking from
      * here would require knowing every region we ever locked, which is more
      * book-keeping than the engine shutdown path actually needs. */
     free(r->locked_mask);
+    free(r->cache_path);
     free(r->hits);
     free(r);
+}
+
+bool ds4_residency_has_loaded_state(const ds4_residency *r) {
+    return r && r->has_loaded_state;
+}
+
+int ds4_residency_save_state(const ds4_residency *r, const char *path) {
+    if (!r || !path || !path[0]) return -1;
+    /* Atomic write: serialize to <path>.tmp, then rename. A crash mid-write
+     * therefore can't leave behind a truncated cache that we'd later try to
+     * load. */
+    size_t plen = strlen(path);
+    char *tmp = malloc(plen + 5);
+    if (!tmp) return -1;
+    memcpy(tmp, path, plen);
+    memcpy(tmp + plen, ".tmp", 5);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) { free(tmp); return -1; }
+
+    ds4_residency_cache_header h;
+    memset(&h, 0, sizeof(h));
+    memcpy(h.magic, DS4_RESIDENCY_CACHE_MAGIC, 8);
+    h.version      = DS4_RESIDENCY_CACHE_VERSION;
+    h.n_layers     = r->opt.n_layers;
+    h.n_experts    = r->opt.n_experts;
+    h.total_tokens = r->total_tokens;
+    h.apply_count  = r->apply_count;
+    const size_t n_cells = (size_t)r->opt.n_layers * r->opt.n_experts;
+    int ok = 1;
+    if (fwrite(&h, sizeof(h), 1, fp) != 1) ok = 0;
+    if (ok && fwrite(r->hits, sizeof(r->hits[0]), n_cells, fp) != n_cells) ok = 0;
+    if (fclose(fp) != 0) ok = 0;
+    if (!ok) { remove(tmp); free(tmp); return -1; }
+    if (rename(tmp, path) != 0) { remove(tmp); free(tmp); return -1; }
+    free(tmp);
+    return 0;
 }
 
 uint64_t ds4_residency_locked_bytes(const ds4_residency *r) {
@@ -430,6 +556,26 @@ void ds4_residency_apply(ds4_residency                  *r,
             }
         }
         r->observed_tokens = 0;
+    }
+
+    /* Persist the post-apply (post-decay) state so the next run starts from
+     * exactly the same counters. We do this every apply rather than only on
+     * shutdown so a kill -9 still leaves a usable cache behind. The file is
+     * ~n_layers * n_experts * 8 bytes -- on DS4 Flash that's ~88 KiB,
+     * which is well below the cost of mistakes here. */
+    if (r->cache_path) {
+        if (ds4_residency_save_state(r, r->cache_path) != 0) {
+            /* Saving is best-effort; a broken cache disk shouldn't kill the
+             * inference run. Warn once and move on. */
+            static bool save_failed_warned = false;
+            if (!save_failed_warned) {
+                fprintf(stderr,
+                        "ds4: residency: failed to write routing cache to %s "
+                        "(errno=%d); continuing without persistence\n",
+                        r->cache_path, errno);
+                save_failed_warned = true;
+            }
+        }
     }
 }
 
