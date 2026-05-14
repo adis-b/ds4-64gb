@@ -1397,6 +1397,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
         @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
+        @[@"DS4_METAL_Q3_K_SOURCE",       @"metal/q3_K.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
         @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
         @[@"DS4_METAL_DSV4_KV_SOURCE",    @"metal/dsv4_kv.metal"],
@@ -5344,6 +5345,137 @@ int ds4_gpu_matmul_q8_0_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 tensor matmul")) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * Q3_K twin of ds4_gpu_matmul_q8_0_tensor.
+ *
+ * Q3_K stores 256 weights per 110-byte super-block (32 high-bit bytes, 64
+ * low-2-bit bytes, 12 packed 6-bit sub-block scales, half super-block scale).
+ * That gives ~3.4 bits per weight, vs 8.5 bpw for Q8_0, so requantizing the
+ * dense attention rows of DS4 Flash from Q8_0 to Q3_K trims the file by
+ * several gigabytes -- room the residency mlock budget can spend on more
+ * top-K experts.
+ *
+ * Two pipelines are dispatched here, matching the q8_0 split:
+ *   - n_tok == 1: kernel_mul_mv_q3_K_f32 (ported from llama.cpp). One
+ *     threadgroup handles N_SG_Q3_K * N_R0_Q3_K rows; ix = tiisg%4 splits
+ *     the K-dim across 4 lanes per super-block.
+ *   - n_tok >  1: kernel_mul_mm_q3_K_f32, the standard ds4 mul_mm template
+ *     instantiated for block_q3_K with nl=16. Tile shape and threadgroup
+ *     memory layout are identical to the q8_0 mul_mm path.
+ *
+ * Q3_K does not have a small-batch ext kernel here; small prefill batches
+ * fall through to mul_mm. The performance hit is bounded -- ext is the
+ * 2..8 token window and DS4 prefill chunks are typically 2048 tokens.
+ */
+int ds4_gpu_matmul_q3_K_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if ((in_dim & 255u) != 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf   = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes   = n_tok * in_dim * sizeof(float);
+        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < x_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            fprintf(stderr, "ds4: Metal Q3_K tensor matmul received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t blocks = in_dim / 256u;
+        const uint64_t row_bytes = blocks * 110u;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal Q3_K tensor matmul range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (n_tok == 1) {
+            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+            /* Q3_K row stride differs from Q8_0 (110 vs 34 bytes per 256 vs 32
+             * elements). Patch the bookkeeping fields that the kernel reads. */
+            mv_args.nb00 = 110;
+            mv_args.nb01 = row_bytes;
+            mv_args.nb02 = row_bytes * out_dim;
+            mv_args.nb03 = row_bytes * out_dim;
+            mv_args.nr0  = 2; /* N_R0_Q3_K */
+
+            const int16_t nsg = 4;
+            id<MTLComputePipelineState> pipeline =
+                ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_q3_K_f32", nsg);
+            if (!pipeline) return 0;
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            /* kernel uses simd_sum, no threadgroup memory needed */
+            [enc setThreadgroupMemoryLength:32 atIndex:0];
+            /* One threadgroup covers nsg*nr0 rows, unlike q8_0 where one
+             * threadgroup covers just nr0 rows (the simdgroups within a
+             * q8_0 tg collaborate on the same NR0 rows over K). */
+            const NSUInteger rows_per_tg = (NSUInteger)nsg * (NSUInteger)mv_args.nr0;
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_per_tg - 1u) / rows_per_tg, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            if (!ds4_gpu_finish_command_buffer(cb, owned, "Q3_K tensor matvec")) {
+                return 0;
+            }
+            return 1;
+        }
+
+        const bool bc_inp = (in_dim % 32u) != 0;
+        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q3_K_f32", bc_inp, bc_out);
+        if (!pipeline) return 0;
+
+        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+                                              ((NSUInteger)out_dim + 63u) / 64u,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Q3_K tensor matmul")) {
             return 0;
         }
     }

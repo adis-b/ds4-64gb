@@ -138,6 +138,13 @@ typedef struct {
 } block_q2_K;
 
 typedef struct {
+    uint8_t  hmask[QK_K / 8];  /* high bit of the 3-bit quants */
+    uint8_t  qs[QK_K / 4];     /* low 2 bits of the 3-bit quants */
+    uint8_t  scales[12];       /* per-sub-block 6-bit scales */
+    uint16_t d;                /* super-block scale (f16) */
+} block_q3_K;
+
+typedef struct {
     uint16_t d;
     uint16_t dmin;
     uint8_t  scales[12];
@@ -165,6 +172,7 @@ typedef struct {
 
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
+DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
@@ -900,6 +908,7 @@ enum {
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_IQ1_S    = 19,
@@ -2352,6 +2361,32 @@ static void tensor_expect_optional(
     if (t) tensor_expect_layout(t, type, ndim, d0, d1, d2);
 }
 
+/*
+ * Layout check for the dense attention matrices (q_a, q_b, kv, output_a/b,
+ * indexer_attn_q_b). Stock DS4 ships these as Q8_0 but on the 64 GB target
+ * they are requantized to Q3_K to free a few extra gigabytes for the
+ * residency mlock budget. The shape is unchanged, only the row encoding
+ * differs, so this helper accepts either type and the Metal dispatch path
+ * branches on t->type at call time.
+ */
+static void tensor_expect_attn_layout(
+        const ds4_tensor *t,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (t->type != DS4_TENSOR_Q8_0 && t->type != DS4_TENSOR_Q3_K) {
+        fprintf(stderr,
+                "ds4: attention tensor %.*s has type %s, expected q8_0 or q3_k\n",
+                (int)t->name.len,
+                t->name.ptr,
+                tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+}
+
 static void tensor_expect_plain_layout(
         const ds4_tensor *t,
         uint32_t          ndim,
@@ -2455,10 +2490,10 @@ static void weights_validate_layout(const ds4_weights *w) {
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
         tensor_expect_layout(l->hc_attn_base,   DS4_TENSOR_F32,  1, hc_mix_dim, 0, 0);
         tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(l->attn_q_a,       DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
+        tensor_expect_attn_layout(l->attn_q_a,       2, DS4_N_EMBD, DS4_N_LORA_Q, 0);
         tensor_expect_layout(l->attn_q_a_norm,  DS4_TENSOR_F32,  1, DS4_N_LORA_Q, 0, 0);
-        tensor_expect_layout(l->attn_q_b,       DS4_TENSOR_Q8_0, 2, DS4_N_LORA_Q, q_dim, 0);
-        tensor_expect_layout(l->attn_kv,        DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
+        tensor_expect_attn_layout(l->attn_q_b,       2, DS4_N_LORA_Q, q_dim, 0);
+        tensor_expect_attn_layout(l->attn_kv,        2, DS4_N_EMBD, DS4_N_HEAD_DIM, 0);
         tensor_expect_layout(l->attn_kv_a_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
         tensor_expect_layout(l->attn_output_a,  DS4_TENSOR_Q8_0, 2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
@@ -9276,6 +9311,31 @@ static bool metal_graph_matmul_plain_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/*
+ * Dense matmul/matvec dispatch for the attention path. Q8_0 is the stock
+ * layout; on the 64 GB target attn_q_a/attn_q_b/attn_kv are requantized to
+ * Q3_K to free room in the residency lock budget. Both backends expose the
+ * same call surface (in_dim, out_dim, n_tok), and only the row-stride and
+ * block decoding differ inside the Metal kernel selection.
+ */
+static inline int ds4_gpu_matmul_attn(
+        ds4_gpu_tensor       *out,
+        const ds4_model      *model,
+        const ds4_tensor     *w,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok) {
+    if (w->type == DS4_TENSOR_Q3_K) {
+        return ds4_gpu_matmul_q3_K_tensor(out, model->map, model->size,
+                                          w->abs_offset, in_dim, out_dim,
+                                          x, n_tok);
+    }
+    return ds4_gpu_matmul_q8_0_tensor(out, model->map, model->size,
+                                      w->abs_offset, in_dim, out_dim,
+                                      x, n_tok);
+}
+
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -9367,18 +9427,16 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD, q_rank,
-                                              g->attn_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_matmul_attn(g->qr, model, layer->attn_q_a,
+                                      DS4_N_EMBD, q_rank,
+                                      g->attn_norm, 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
     }
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_attn(g->kv_raw, model, layer->attn_kv,
+                                          DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                          g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
@@ -9406,10 +9464,9 @@ static bool metal_graph_encode_decode_layer(
     if (qkv_rms_fused && ok) {
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
-                                              layer->attn_q_b->abs_offset,
-                                              q_rank, q_dim,
-                                              g->qr_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_matmul_attn(g->q, model, layer->attn_q_b,
+                                      q_rank, q_dim,
+                                      g->qr_norm, 1) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
@@ -9427,10 +9484,9 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
     }
     if (!qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_attn(g->kv_raw, model, layer->attn_kv,
+                                          DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                          g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
@@ -11375,28 +11431,26 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
-                                              model->map,
-                                              model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD,
-                                              q_rank,
-                                              g->batch_attn_norm,
-                                              n_tokens) != 0;
+    if (ok) ok = ds4_gpu_matmul_attn(g->batch_qr,
+                                      model,
+                                      layer->attn_q_a,
+                                      DS4_N_EMBD,
+                                      q_rank,
+                                      g->batch_attn_norm,
+                                      n_tokens) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->batch_qr,
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HEAD_DIM,
-                                                  g->batch_attn_norm,
-                                                  n_tokens) != 0;
+        if (ok) ok = ds4_gpu_matmul_attn(g->batch_kv_raw,
+                                          model,
+                                          layer->attn_kv,
+                                          DS4_N_EMBD,
+                                          DS4_N_HEAD_DIM,
+                                          g->batch_attn_norm,
+                                          n_tokens) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -11432,14 +11486,13 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a_norm");
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_q,
-                                              model->map,
-                                              model->size,
-                                              layer->attn_q_b->abs_offset,
-                                              q_rank,
-                                              q_dim,
-                                              g->batch_qr_norm,
-                                              n_tokens) != 0;
+    if (ok) ok = ds4_gpu_matmul_attn(g->batch_q,
+                                      model,
+                                      layer->attn_q_b,
+                                      q_rank,
+                                      q_dim,
+                                      g->batch_qr_norm,
+                                      n_tokens) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->batch_q,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
@@ -11476,14 +11529,13 @@ static bool metal_graph_encode_layer_attention_batch(
     DS4_METAL_PROFILE_Q_STAGE("rope");
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
     if (!qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HEAD_DIM,
-                                                  g->batch_attn_norm,
-                                                  n_tokens) != 0;
+        if (ok) ok = ds4_gpu_matmul_attn(g->batch_kv_raw,
+                                          model,
+                                          layer->attn_kv,
+                                          DS4_N_EMBD,
+                                          DS4_N_HEAD_DIM,
+                                          g->batch_attn_norm,
+                                          n_tokens) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
