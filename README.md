@@ -109,33 +109,42 @@ gate/up/down tensors, both on CPU and on Metal:
 - Run `make metal-smoke` to compile the Metal source without loading a model;
   it surfaces MSL errors before you wait on a multi-GB download.
 
-The first prototype GGUF is meant to flip all routed-expert tensors to IQ1_S:
+This fork ships two GGUF recipes for 64 GB: a routed-experts-only IQ1_S
+file (the original 64 GB prototype) and a follow-up that additionally
+requantizes the dense attention projections to Q3_K to free a few hundred
+MiB of mlock budget for more routed experts.
 
-| Tensor          | q2 (current) | q1 (this branch) |
-| ---             | ---          | ---              |
-| ffn_gate_exps   | IQ2_XXS      | IQ1_S            |
-| ffn_up_exps     | IQ2_XXS      | IQ1_S            |
-| ffn_down_exps   | Q2_K         | IQ1_S            |
-| everything else | unchanged    | unchanged        |
+| Tensor              | q2 (128 GB target) | q1 (sparse residency) | q1 + Q3K attn (this fork) |
+| ---                 | ---                | ---                   | ---                       |
+| ffn_gate_exps       | IQ2_XXS            | IQ1_S                 | IQ1_S                     |
+| ffn_up_exps         | IQ2_XXS            | IQ1_S                 | IQ1_S                     |
+| ffn_down_exps       | Q2_K               | IQ1_S                 | IQ1_S                     |
+| attn_q_a/q_b/kv     | Q8_0               | Q8_0                  | **Q3_K**                  |
+| attn_output_a/b     | Q8_0               | Q8_0                  | Q8_0 (fused kernels)      |
+| everything else     | unchanged          | unchanged             | unchanged                 |
+| disk size           | 86.7 GB            | ~63 GB                | ~58.6 GB                  |
 
-Projected file size: ~63 GB on disk (~24 GB saved versus q2). That fits
-comfortably on 96 GB Mac Studios but is **still too large to be fully resident
-on a 64 GB Mac** once macOS (~14 GB), the ds4 process state and KV cache (~3-5
-GB at 32k context) are accounted for. The realistic resident-weights ceiling on
-a 64 GB box is around 45 GB.
+The IQ1_S variant fits comfortably on 96 GB Mac Studios but is **still
+too large to be fully resident on a 64 GB Mac** once macOS (~14 GB), the
+ds4 process state and KV cache (~3-5 GB at 32k context) are accounted
+for. The realistic resident-weights ceiling on a 64 GB box is around 45
+GB. The Q3K-attn variant shaves another 4 GB off and trims the
+always-hot attention footprint from 8.20 to 7.19 GiB, leaving more of
+the mlock budget for routed experts.
 
-Two ways to close that gap on a 64 GB machine:
+The actual closing of that gap is a sparse-residency stack on the
+mmap'd model: keep the GGUF mmap'd, mark non-expert tensors as
+`WILLNEED` and routed-expert blobs as `DONTNEED`, track which experts
+the router actually selects per layer, and `mlock` only the top-K
+most-used. Routing telemetry is read back live from the Metal graph
+and persisted across runs so restarts skip the cold warm-up window.
+That is implemented behind `--resident-experts-per-layer`, see
+[Sparse residency for 64 GB](#sparse-residency-for-64-gb) below for
+the full picture.
 
-1. Sparse residency: keep the q1 (or even q2) GGUF mmap'd, mark non-expert
-   tensors as `WILLNEED` and routed-expert blobs as `DONTNEED`, then track
-   which experts the router actually selects per layer and `WILLNEED` only
-   the top-K most-used. That is implemented behind
-   `--resident-experts-per-layer` (see "Sparse residency for 64 GB" below).
-2. A sub-1.5 bpw quant for routed experts (TQ1_0 ternary or a custom 1.0 bpw
-   format). Out of scope for this branch.
-
-To build the GGUF from the existing q2 file using `llama.cpp` (untested
-end-to-end with this engine; please file an issue if you try it):
+To build the IQ1_S routed-experts GGUF from the existing q2 file using
+`llama.cpp` (untested end-to-end with this engine; please file an issue
+if you try it):
 
 ```sh
 # Once: get llama-quantize built somewhere on PATH.
@@ -150,53 +159,186 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && cmake -B buil
   COPY
 ```
 
+To additionally requantize the dense attention projections to Q3_K (the
+Q3K-attn variant the residency policy is tuned for):
+
+```sh
+LLAMA_ALLOW_IMATRIX_FREE_QUANT=1 ./build/bin/llama-quantize \
+  --allow-requantize \
+  --tensor-type 'blk\.[0-9]+\.attn_q_a\.weight=q3_k' \
+  --tensor-type 'blk\.[0-9]+\.attn_q_b\.weight=q3_k' \
+  --tensor-type 'blk\.[0-9]+\.attn_kv\.weight=q3_k' \
+  ../ds4-64gb/gguf/DeepSeek-V4-Flash-IQ1S-routed-experts.gguf \
+  ../ds4-64gb/gguf/DeepSeek-V4-Flash-IQ1S-Q3KAttn.gguf \
+  COPY
+```
+
+This relies on two small patches to `llama.cpp`'s quantizer: honoring
+`--tensor-type` overrides under `COPY` mode and accepting Q3_K without
+an importance matrix (`LLAMA_ALLOW_IMATRIX_FREE_QUANT=1`). The `attn_output_a/b`
+tensors are deliberately left at Q8_0 because they go through fused
+decode kernels (`ds4_gpu_attention_output_low_q8_tensor` and the
+`q8_0_hc_expand` variants) that would need their own Q3_K twins; not
+worth it without first showing the simpler attn path actually buys
+throughput.
+
 Then point `ds4` at the new file:
 
 ```sh
-./ds4 -m gguf/DeepSeek-V4-Flash-IQ1S-routed-experts.gguf --ctx 32768 -p "Hi"
+./ds4 -m gguf/DeepSeek-V4-Flash-IQ1S-Q3KAttn.gguf --ctx 32768 -p "Hi"
 ```
 
-`./download_model.sh q1` is a placeholder for a future hosted version of the
-same file; it currently points at `adis-b/ds4-64gb-gguf` which is empty until
-someone uploads a tested artifact.
+`./download_model.sh q1` is a placeholder for a future hosted version of
+these files; it currently points at `adis-b/ds4-64gb-gguf` which is
+empty until someone uploads a tested artifact.
 
 ### Sparse residency for 64 GB
 
-Since neither the q2 GGUF (87 GB) nor the q1 variant (~63 GB) fits fully in 64
-GB once macOS and KV cache are accounted for, this fork adds a sparse-residency
-policy on the mmap'd model. Two pieces:
+Since neither the q2 GGUF (87 GB) nor the q1 variant (~63 GB) fits fully
+in 64 GB once macOS and KV cache are accounted for, this fork adds a
+sparse-residency stack on the mmap'd model. There are six pieces, all
+landed today and enabled together by the recommended command below:
 
-1. **Smart warm at startup.** With `--resident-experts-per-layer N` set, the
-   engine replaces the brute-force `--warm-weights` pass (which would just
-   thrash the page cache for an 87 GB file on a 64 GB box) with a smarter
-   default: `WILLNEED` on every non-expert tensor, `DONTNEED` on the routed
-   `ffn_(gate|up|down)_exps.weight` blobs. Always-hot weights stay resident;
-   experts page in lazily as the router asks for them, and the OS page cache
-   keeps the recently-used ones around naturally.
+1. **Smart warm at startup.** With `--resident-experts-per-layer N` set,
+   the engine replaces the brute-force `--warm-weights` pass (which would
+   just thrash the page cache for an 87 GB file on a 64 GB box) with a
+   smarter default: `WILLNEED` on every non-expert tensor, `DONTNEED` on
+   the routed `ffn_(gate|up|down)_exps.weight` blobs. Always-hot weights
+   stay resident; experts page in lazily as the router asks for them.
 
-2. **Adaptive top-K (Phase 1, in progress).** Counters are scaffolded; the
-   engine reads back router selections per token, exponentially decays
-   per-(layer, expert) hit counts, and every `--learn-routing-tokens` tokens
-   re-applies the top-K decision: `WILLNEED` on the most-used N experts per
-   layer, optional `DONTNEED` on the rest with `--residency-evict-cold`. Wiring
-   the routing telemetry through the Metal graph is a separate change; for now
-   `--learn-routing-tokens > 0` is accepted but only the static essentials warm
-   takes effect.
+2. **mlock pinning.** Advisory hints only ask the OS nicely; under memory
+   pressure the page cache will still evict your hot working set and ds4
+   spends every token re-reading the same pages from SSD.
+   `--residency-lock-budget-gib F` instead **pins** warm regions
+   physically. Essentials lock first; the remainder of the budget is
+   spent on the top-K routed experts. Beyond the budget the policy falls
+   back to WILLNEED so the OS is never starved.
 
-Recommended starting point on a 64 GB Mac (with the q1 GGUF):
+3. **Adaptive top-K with live routing telemetry.** The Metal graph reads
+   back the router's expert selections after every token, the residency
+   module exponentially decays per-(layer, expert) hit counts with
+   `--residency-decay`, and every `--learn-routing-tokens` tokens it
+   re-applies the top-K decision: WILLNEED + mlock on the most-used N
+   experts per layer, optional `DONTNEED` on the rest with
+   `--residency-evict-cold`. The mlock budget is recomputed per apply so
+   experts that fall out of the top-K release their pin to the new ones.
+
+4. **Auto-split command buffers.** Apple's `MTLBuffer` residency set has
+   a cap well below the 64 GB target. The Metal graph backend splits the
+   prefill and decode command buffers into chunks small enough to fit
+   the per-command-buffer residency set, so the model can mmap fully
+   even when it exceeds `recommendedMaxWorkingSetSize`.
+
+5. **Q3_K attention kernels.** The dense attention projections
+   (`attn_q_a`, `attn_q_b`, `attn_kv`) ship as Q8_0 in the upstream
+   GGUF. New Metal kernels (`block_q3_K`, `dequantize_q3_K`,
+   `kernel_mul_mv_q3_K_f32`, `kernel_mul_mm_q3_K_f32`, ported
+   template-style from `llama.cpp`) let those rows be requantized to
+   Q3_K, shaving ~1.04 GiB off the always-hot footprint that the mlock
+   budget would otherwise spend on attention.
+
+6. **Routing-cache persistence.** `--residency-cache PATH` writes the
+   per-(layer, expert) hit counters to a tiny binary blob after every
+   apply and on shutdown. On the next run the engine seeds the policy
+   from disk and calls apply() **before any Metal command buffer is
+   built**, so the first generated token is already routed against the
+   previously hot expert set instead of paying for
+   `learn-routing-tokens` worth of cold-page-in.
+
+### Recommended invocation on a 64 GB Mac
 
 ```sh
-./ds4 -m gguf/DeepSeek-V4-Flash-IQ1S-routed-experts.gguf \
+./ds4 -m gguf/DeepSeek-V4-Flash-IQ1S-Q3KAttn.gguf \
       --ctx 32768 \
-      --resident-experts-per-layer 96 \
+      --resident-experts-per-layer 144 \
+      --learn-routing-tokens 8 \
+      --residency-decay 0.5 \
+      --residency-lock-budget-gib 48 \
+      --residency-cache /tmp/ds4-routing.bin \
       --residency-stats \
       -p "Hi"
 ```
 
-The exact best K depends on your workload. `96/256` covers a large chunk of
-typical routing for chat-style sessions; lower values save more RAM at the cost
-of more first-use page-in stalls. With `--residency-stats`, the engine prints a
+This pins ~7.2 GiB of essentials + ~28.6 GiB of routed experts (~35.8
+GiB total locked, under the 48 GiB budget) and runs at roughly 0.10 t/s
+decode once the first apply has landed.
+
+`K = 144` is the practical maximum on a 64 GB M3 Max. K=152 with the
+same budget pushes locked memory to ~37.5 GiB and tips past the macOS
+working-set wall, collapsing throughput to ~0.02 t/s. Lower K saves
+more RAM at the cost of more first-use page-in stalls; the right value
+is workload-dependent. With `--residency-stats`, the engine prints a
 per-layer "top-8 covers X%" histogram on exit so you can tune.
+
+### Measured throughput on 64 GB
+
+64 GB M3 Max, IQ1_S + Q3K-attn GGUF, K=144, budget=48 GiB,
+`learn-routing-tokens=8`, `-n 24`:
+
+| Run                                  | Prefill   | Generation | Wall time |
+| ---                                  | ---:      | ---:       | ---:      |
+| cold (no routing cache)              | 0.25 t/s  | 0.07 t/s   | 350 s     |
+| warm (cache from prior run)          | 0.46 t/s  | 0.10 t/s   | 262 s     |
+
+Generation on a 64 GB Mac runs at ~0.10 t/s with the residency policy
+active, compared to 26-37 t/s on the 128 GB+ machines in the [Speed
+table above](#speed). The 64 GB box simply doesn't fit; the residency
+policy minimizes how often the OS has to read cold pages from SSD, but
+every routed-expert miss still costs multiple page faults. The point of
+this work is to keep DS4 Flash *usable* on 64 GB hardware, not to match
+a properly-sized machine.
+
+### What we achieved
+
+- **DS4 Flash now runs end-to-end on a 64 GB Mac** with the IQ1_S +
+  Q3K-attn variant, producing coherent text at ~0.10 t/s instead of
+  thrashing the SSD into oblivion.
+- **Hot working set is genuinely pinned**, not just hinted: 35.8 GiB
+  mlocked under a 48 GiB budget means the macOS page-cache eviction
+  loop that previously cost a multi-second stall on every token is
+  gone for the top-K experts.
+- **Routing learning persists across restarts**, so identical workloads
+  no longer pay the learn-routing-tokens cold-start tax on every
+  invocation. Cold-vs-warm comparison: 43% faster generation, 84%
+  faster prefill on a short run.
+- **Attention layers shrank** from Q8_0 to Q3_K via new Metal kernels,
+  trimming ~1.04 GiB off the always-hot footprint (8.20 GiB → 7.19
+  GiB) so the mlock budget spends more on routed experts instead.
+- **Working-set wall is mapped.** We now know that K=144 is the
+  practical maximum on a 64 GB M3 Max; pushing harder doesn't help and
+  actively degrades throughput once locked memory crosses ~37 GiB.
+
+### Possible next steps
+
+Obvious wins still on the table, roughly in order of expected impact:
+
+- **Sub-1.5 bpw routed experts.** A TQ1_0 ternary or custom 1.0 bpw
+  format for `ffn_(gate|up|down)_exps` would shrink the model another
+  ~25% and let more experts fit in the same mlock budget. Almost
+  certainly the single largest lever left.
+- **Expert prefetch.** The router decides which experts to use *before*
+  the expert matmul launches. Issuing `WILLNEED` on the next predicted
+  expert set during the current token's compute could overlap SSD
+  page-in with Metal work and reduce miss penalty without growing the
+  mlock budget. Especially attractive for cold experts that fall outside
+  the top-K.
+- **Q3_K for `attn_output_a/b`.** These remaining Q8_0 attention
+  tensors run through fused decode kernels
+  (`ds4_gpu_attention_output_low_q8_tensor` and the `q8_0_hc_expand`
+  variants) that would need their own Q3_K twins. Another few hundred
+  MiB of essentials savings, and the natural follow-up to the existing
+  Q3_K attention work.
+- **Heterogeneous K per layer.** The router doesn't hit every layer
+  equally hard; some concentrate >90% of routing mass into the top-8
+  experts while others spread thinner. A per-layer K proportional to
+  entropy could spend the mlock budget more efficiently than the
+  current flat K.
+- **MTP speculative decoding integration.** The draft path (`--mtp`,
+  `--mtp-draft`) is correctness-gated and currently gives at most a
+  slight speedup on full-RAM hardware. On 64 GB where every miss costs
+  SSD reads, accepting multiple tokens per page-in event could be a
+  larger win, but it needs the draft model to share the residency
+  budget intelligently.
 
 ## Speed
 
